@@ -5,7 +5,7 @@ import schedule
 
 # Configurações do Master alvo
 MASTER_IP = '10.62.206.35'
-MASTER_PORT = 5000
+MASTER_PORT = 8000
 WORKER_UUID = "WRK-01-ALPHA"
 
 def enviar_heartbeat():
