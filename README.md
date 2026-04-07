@@ -2,7 +2,7 @@
 
 ## Visão Geral
 
-Este projeto implementa um sistema **peer-to-peer (P2P)** onde múltiplos computadores (workers) se conectam a um servidor central (master). O sistema é **tolerante a falhas**: se o master cair, os próprios workers elegem automaticamente um novo master entre si, sem intervenção humana.
+Este projeto implementa um sistema **peer-to-peer (P2P)** onde múltiplos computadores (workers) se conectam a um servidor central (master). O sistema é **tolerante a falhas**: se o master cair, os próprios workers elegem automaticamente um novo master entre si, sem intervenção humana. Além disso, o master distribui tarefas para os workers processarem, formando um sistema de computação distribuída completo.
 
 ---
 
@@ -10,13 +10,13 @@ Este projeto implementa um sistema **peer-to-peer (P2P)** onde múltiplos comput
 
 | Arquivo | Papel |
 |---|---|
-| `servidor.py` | Roda no master. Recebe heartbeats dos workers e mantém o registro de quem está ativo. |
-| `cliente.py` | Roda em cada worker. Envia heartbeats, detecta falha do master e participa da eleição. |
-| `.env` | Configuração de cada máquina (IP do master, UUID do worker, porta, etc.). |
+| `servidor.py` | Roda no master. Recebe heartbeats, mantém registro de workers, gerencia fila de tarefas e distribui trabalho. |
+| `cliente.py` | Roda em cada worker. Envia heartbeats, solicita e executa tarefas, participa da eleição se o master cair. |
+| `.env` | Configuração de cada máquina (IP do master, UUID do worker, porta, intervalos, etc.). |
 
 ---
 
-## Como o Sistema Funciona
+## Sprint 1 — Infraestrutura e Eleição de Master
 
 ### 1. Situação Normal
 
@@ -145,6 +145,120 @@ A eleição usa **TCP** (não UDP broadcast) para contatar os peers porque:
 
 ---
 
+## Sprint 2 — Comunicação de Tarefas e Ciclo de Vida
+
+### 5. Apresentação do Worker ao Master
+
+Além do heartbeat periódico, cada worker se **apresenta formalmente** ao master a cada `TASK_INTERVAL` segundos (padrão: 10s) para solicitar uma tarefa.
+
+Existem dois tipos de apresentação:
+
+**Payload 2.1 — Worker local** (conectado ao seu master original):
+```json
+{
+  "WORKER": "ALIVE",
+  "WORKER_UUID": "WRK-01-ALPHA"
+}
+```
+
+**Payload 2.1b — Worker "Emprestado"** (após eleição, conectado a um master diferente do original):
+```json
+{
+  "WORKER": "ALIVE",
+  "WORKER_UUID": "WRK-01-ALPHA",
+  "SERVER_UUID": "SRV-MASTER"
+}
+```
+
+> Um worker é considerado **"Emprestado"** quando o master atual (eleito via Bully Algorithm) tem UUID diferente do master original configurado no `.env`. O campo `SERVER_UUID` identifica de qual master original esse worker veio.
+
+---
+
+### 6. Fila de Tarefas e Distribuição
+
+O master mantém uma **fila de tarefas** (`task_queue`). Ao receber a apresentação de um worker, ele verifica a fila:
+
+**Com tarefa disponível — Payload 2.2:**
+```json
+{
+  "TASK": "QUERY",
+  "USER": "user1",
+  "TASK_ID": "task-001"
+}
+```
+
+**Fila vazia — Payload 2.3:**
+```json
+{
+  "TASK": "NO_TASK"
+}
+```
+
+A fila é inicializada com tarefas na inicialização do servidor. A distribuição é **FIFO** (primeiro a entrar, primeiro a sair) e cada tarefa é entregue a apenas um worker.
+
+---
+
+### 7. Processamento e Relatório de Status
+
+Ao receber uma tarefa `QUERY`, o worker:
+1. Simula o processamento (tempo aleatório entre 1 e 4 segundos)
+2. Determina o resultado (90% de chance de `OK`, 10% de `NOK`)
+3. Reporta o resultado ao master
+
+**Payload 2.4 — Relatório de resultado:**
+```json
+{
+  "STATUS": "OK",
+  "TASK": "QUERY",
+  "WORKER_UUID": "WRK-01-ALPHA"
+}
+```
+
+Se o worker for "Emprestado", inclui também o `SERVER_UUID` no relatório.
+
+---
+
+### 8. Confirmação (ACK) e Log de Conclusão
+
+Ao receber o resultado do worker, o master:
+1. Registra no log interno: worker, tarefa, status, origem (local/emprestado) e timestamp
+2. Responde imediatamente com ACK para liberar o worker
+
+**Payload 2.5 — Confirmação:**
+```json
+{
+  "STATUS": "ACK"
+}
+```
+
+Exemplo de log no master:
+```
+[MASTER] LOG | Worker=WRK-02-BETA (local) | Task=task-001 | Status=OK
+[MASTER] LOG | Worker=WRK-01-ALPHA (emprestado de SRV-MASTER) | Task=task-002 | Status=OK
+```
+
+---
+
+### 9. Fluxo Completo de uma Tarefa
+
+```
+Worker                              Master
+  │                                   │
+  │── {"WORKER": "ALIVE", ...} ──────►│  (Payload 2.1 ou 2.1b)
+  │                                   │  Verifica fila
+  │◄── {"TASK": "QUERY", "USER": ...} │  (Payload 2.2) — se há tarefa
+  │    ou {"TASK": "NO_TASK"}         │  (Payload 2.3) — se fila vazia
+  │                                   │
+  │  [Processa por 1–4 segundos]      │
+  │                                   │
+  │── {"STATUS": "OK", ...} ─────────►│  (Payload 2.4)
+  │                                   │  Loga conclusão
+  │◄── {"STATUS": "ACK"} ─────────────│  (Payload 2.5)
+  │                                   │
+```
+
+---
+
 ## Configuração (`.env`)
 
 Cada máquina precisa de um `.env` com sua identidade. O IP do master é o único dado que precisa ser configurado manualmente.
@@ -153,15 +267,18 @@ Cada máquina precisa de um `.env` com sua identidade. O IP do master é o únic
 # IP e porta do master original
 MASTER_IP=192.168.1.100
 MASTER_PORT=8000
-SERVER_UUID=SRV-MASTER   # usado apenas no servidor.py
+SERVER_UUID=SRV-MASTER      # UUID do master (usado em servidor.py e para detectar "Emprestado")
 
 # Identidade deste worker (único por máquina)
 WORKER_UUID=WRK-01-ALPHA
 WORKER_PORT=8000
 
-# Quantas falhas de heartbeat antes de iniciar eleição
-HEARTBEAT_THRESHOLD=4
-HEARTBEAT_INTERVAL=5      # segundos entre cada heartbeat
+# Controle de heartbeat e eleição
+HEARTBEAT_THRESHOLD=4       # falhas consecutivas antes de iniciar eleição
+HEARTBEAT_INTERVAL=5        # segundos entre cada heartbeat
+
+# Controle de tarefas (Sprint 2)
+TASK_INTERVAL=10            # segundos entre cada solicitação de tarefa
 ```
 
 > `WORKER_PEERS` pode ficar **vazio** — os peers são descobertos automaticamente via master.
@@ -172,12 +289,19 @@ HEARTBEAT_INTERVAL=5      # segundos entre cada heartbeat
 
 ```
 [INÍCIO]
-  servidor.py rodando na máquina master (IP configurado no .env de cada worker)
+  servidor.py rodando na máquina master
   cliente.py rodando em cada worker
 
-[OPERAÇÃO NORMAL]
-  Workers enviam heartbeat a cada 5s → master responde ALIVE + lista de peers
-  Workers atualizam known_peers com a lista recebida
+[OPERAÇÃO NORMAL — Sprint 1]
+  Workers enviam heartbeat a cada 5s
+  → Master responde ALIVE + lista de peers ativos
+  → Workers atualizam known_peers automaticamente
+
+[CICLO DE TAREFAS — Sprint 2]
+  Workers se apresentam ao master a cada 10s
+  → Master verifica fila e envia QUERY ou NO_TASK
+  → Se QUERY: worker processa e reporta STATUS (OK/NOK)
+  → Master confirma com ACK e registra no log
 
 [FALHA DO MASTER]
   Workers detectam 4 heartbeats sem resposta
