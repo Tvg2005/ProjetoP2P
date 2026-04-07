@@ -11,7 +11,10 @@ for name in required_env:
     if name not in os.environ:
         raise EnvironmentError(f"Missing required environment variable: {name}")
 
-HOST = os.environ["MASTER_IP"]
+# Quando lançado como subprocesso pelo worker eleito, MASTER_IP é sobrescrito
+# para o IP do próprio worker. Fazemos bind em 0.0.0.0 para garantir escuta
+# em todas as interfaces da máquina.
+HOST = "0.0.0.0"
 PORT = int(os.environ["MASTER_PORT"])
 SERVER_UUID = os.environ["SERVER_UUID"]
 
