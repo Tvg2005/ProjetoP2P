@@ -1,5 +1,6 @@
 import os
 import json
+import queue
 import socket
 import threading
 import time
@@ -16,19 +17,16 @@ HOST        = "0.0.0.0"
 PORT        = int(os.environ["MASTER_PORT"])
 SERVER_UUID = os.environ["SERVER_UUID"]
 
-# Tempo (segundos) sem heartbeat para considerar um worker inativo
 WORKER_STALE_TIMEOUT = int(os.getenv("WORKER_STALE_TIMEOUT", "30"))
 
 # ── Registro de workers ───────────────────────────────────────────────────────
-# Mantém todos os workers que enviaram heartbeat recentemente.
-# Estrutura: { worker_uuid: {uuid, host, port, last_seen} }
+# { worker_uuid: {uuid, host, port, last_seen} }
 
 registry      = {}
 registry_lock = threading.Lock()
 
 
 def _register_worker(uuid, host, port):
-    """Atualiza ou adiciona um worker no registro."""
     with registry_lock:
         registry[uuid] = {
             "uuid":      uuid,
@@ -39,13 +37,9 @@ def _register_worker(uuid, host, port):
 
 
 def _get_active_peers(exclude_uuid=None):
-    """
-    Retorna lista de workers ativos (vistos dentro de WORKER_STALE_TIMEOUT).
-    Exclui o worker com exclude_uuid (normalmente o próprio solicitante).
-    """
+    """Retorna lista de workers ativos, removendo os inativos."""
     now = time.time()
     with registry_lock:
-        # Remove workers inativos
         stale = [u for u, w in registry.items()
                  if now - w["last_seen"] > WORKER_STALE_TIMEOUT]
         for u in stale:
@@ -59,11 +53,45 @@ def _get_active_peers(exclude_uuid=None):
         ]
 
 
+# ── Fila de Tarefas ───────────────────────────────────────────────────────────
+# Cada tarefa é um dict: {"id": str, "USER": str}
+
+task_queue    = queue.Queue()
+task_log      = []          # histórico de tarefas concluídas
+task_log_lock = threading.Lock()
+
+# Popula fila com tarefas iniciais de exemplo
+_INITIAL_TASKS = [
+    {"id": f"task-{i:03d}", "USER": f"user{i}"}
+    for i in range(1, 21)
+]
+for _t in _INITIAL_TASKS:
+    task_queue.put(_t)
+
+print(f"[MASTER] Fila iniciada com {task_queue.qsize()} tarefas.")
+
+
+def _log_task(worker_uuid, task_id, status, origin):
+    """Registra conclusão de tarefa no log."""
+    entry = {
+        "worker":    worker_uuid,
+        "task_id":   task_id,
+        "status":    status,
+        "origin":    origin,   # 'local' ou 'emprestado de <SERVER_UUID>'
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with task_log_lock:
+        task_log.append(entry)
+    print(f"[MASTER] LOG | Worker={worker_uuid} ({origin}) | "
+          f"Task={task_id} | Status={status}")
+
+
 # ── Handler de conexão ────────────────────────────────────────────────────────
 
 def handle_client(conn, addr):
     print(f"[MASTER] Conectado: {addr}")
-    buffer = ""
+    buffer       = ""
+    current_task = None   # tarefa atribuída nesta conexão (aguardando STATUS)
 
     try:
         while True:
@@ -79,28 +107,76 @@ def handle_client(conn, addr):
                 except json.JSONDecodeError:
                     continue
 
-                task = msg.get("TASK")
                 print(f"[MASTER] Recebido de {addr}: {msg}")
 
-                if task == "HEARTBEAT":
+                # ── HEARTBEAT ─────────────────────────────────────────────────
+                if msg.get("TASK") == "HEARTBEAT":
                     worker_uuid = msg.get("WORKER_UUID")
                     worker_host = msg.get("WORKER_HOST")
                     worker_port = msg.get("WORKER_PORT")
 
-                    # Registra o worker se ele informou seus dados de contato
                     if worker_uuid and worker_host and worker_port:
                         _register_worker(worker_uuid, worker_host, worker_port)
 
-                    # Devolve a lista de peers ativos para o worker usar na eleição
                     peers = _get_active_peers(exclude_uuid=worker_uuid)
 
-                    response = {
+                    conn.send((json.dumps({
                         "SERVER_UUID": SERVER_UUID,
                         "TASK":        "HEARTBEAT",
                         "RESPONSE":    "ALIVE",
-                        "PEERS":       peers,   # ← lista de outros workers ativos
-                    }
-                    conn.send((json.dumps(response) + "\n").encode())
+                        "PEERS":       peers,
+                    }) + "\n").encode())
+
+                # ── APRESENTAÇÃO DO WORKER (Payload 2.1 / 2.1b) ───────────────
+                elif msg.get("WORKER") == "ALIVE":
+                    worker_uuid = msg.get("WORKER_UUID", "?")
+                    origin_uuid = msg.get("SERVER_UUID")   # presente se "emprestado"
+
+                    if origin_uuid:
+                        origin = f"emprestado de {origin_uuid}"
+                    else:
+                        origin = "local"
+
+                    print(f"[MASTER] Worker {worker_uuid} se apresentou ({origin})")
+
+                    # Distribui tarefa ou informa fila vazia
+                    try:
+                        current_task = task_queue.get_nowait()
+                        print(f"[MASTER] Distribuindo {current_task['id']} "
+                              f"→ {worker_uuid}")
+                        # Payload 2.2
+                        conn.send((json.dumps({
+                            "TASK":    "QUERY",
+                            "USER":    current_task["USER"],
+                            "TASK_ID": current_task["id"],
+                        }) + "\n").encode())
+
+                    except queue.Empty:
+                        print(f"[MASTER] Fila vazia para {worker_uuid}")
+                        # Payload 2.3
+                        conn.send((json.dumps({
+                            "TASK": "NO_TASK",
+                        }) + "\n").encode())
+                        current_task = None
+
+                # ── RESULTADO DO WORKER (Payload 2.4) ─────────────────────────
+                elif msg.get("STATUS") in ("OK", "NOK") and msg.get("TASK") == "QUERY":
+                    worker_uuid = msg.get("WORKER_UUID", "?")
+                    status      = msg.get("STATUS")
+                    task_id     = current_task["id"] if current_task else "?"
+
+                    # Determina origem (local ou emprestado)
+                    origin_uuid = msg.get("SERVER_UUID")
+                    origin = f"emprestado de {origin_uuid}" if origin_uuid else "local"
+
+                    _log_task(worker_uuid, task_id, status, origin)
+
+                    # Payload 2.5 — ACK imediato
+                    conn.send((json.dumps({
+                        "STATUS": "ACK",
+                    }) + "\n").encode())
+
+                    current_task = None
 
                 else:
                     conn.send((json.dumps({

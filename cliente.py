@@ -53,6 +53,10 @@ HEARTBEAT_THRESHOLD       = int(os.getenv("HEARTBEAT_THRESHOLD", "4"))
 HEARTBEAT_INTERVAL        = int(os.getenv("HEARTBEAT_INTERVAL", "5"))
 ELECTION_STATUS_TIMEOUT   = int(os.getenv("ELECTION_STATUS_TIMEOUT", "4"))
 NEW_MASTER_WAIT           = int(os.getenv("NEW_MASTER_WAIT", "12"))
+TASK_INTERVAL             = int(os.getenv("TASK_INTERVAL", "10"))
+
+# UUID do master original configurado no .env (usado para detectar "Emprestado")
+ORIGINAL_SERVER_UUID = os.getenv("SERVER_UUID", "")
 
 
 # ── Helpers de inicialização ──────────────────────────────────────────────────
@@ -104,8 +108,7 @@ print(f"  Master inicial  : {MASTER_IP}:{MASTER_PORT}")
 print("=" * 60)
 
 if not STATIC_PEERS:
-    print("[AVISO] WORKER_PEERS está vazio! A eleição NÃO funcionará de forma "
-          "confiável sem os IPs dos outros workers configurados.")
+    print("[INFO] WORKER_PEERS vazio — peers serão aprendidos automaticamente via master.")
 
 
 # ── Estado global ─────────────────────────────────────────────────────────────
@@ -601,6 +604,123 @@ def enviar_heartbeat():
         print("[HEARTBEAT] Encerrado.\n")
 
 
+# ── Ciclo de tarefas (Sprint 2) ──────────────────────────────────────────────
+
+def pedir_tarefa():
+    """
+    Ciclo completo de tarefa conforme Sprint 2:
+      1. Worker se apresenta ao master (Payload 2.1 ou 2.1b se emprestado)
+      2. Master responde QUERY ou NO_TASK
+      3. Se QUERY: worker processa e reporta STATUS (Payload 2.4)
+      4. Master confirma com ACK (Payload 2.5)
+    """
+    import random
+
+    with state_lock:
+        if is_master:
+            return   # master não pede tarefas
+        master_ip   = current_master["ip"]
+        master_port = current_master["port"]
+        master_uuid = current_master.get("uuid", "")
+
+    # Payload 2.1 — apresentação
+    payload = {
+        "WORKER":      "ALIVE",
+        "WORKER_UUID": WORKER_UUID,
+    }
+
+    # Payload 2.1b — "Emprestado": master atual é diferente do original
+    if ORIGINAL_SERVER_UUID and master_uuid != ORIGINAL_SERVER_UUID:
+        payload["SERVER_UUID"] = ORIGINAL_SERVER_UUID
+        print(f"[TAREFA] Modo EMPRESTADO (master original: {ORIGINAL_SERVER_UUID})")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10)
+
+    try:
+        sock.connect((master_ip, master_port))
+        print(f"[TAREFA] Conectado ao master {master_ip}:{master_port}")
+
+        # Passo 1: envia apresentação
+        sock.sendall((json.dumps(payload) + "\n").encode())
+
+        buf = ""
+        # Passo 2: aguarda QUERY ou NO_TASK
+        while True:
+            try:
+                chunk = sock.recv(4096).decode()
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if "\n" not in buf:
+                continue
+
+            line, buf = buf.split("\n", 1)
+            try:
+                resp = json.loads(line)
+            except Exception:
+                continue
+
+            task_type = resp.get("TASK")
+
+            # Payload 2.3 — sem tarefas
+            if task_type == "NO_TASK":
+                print("[TAREFA] Nenhuma tarefa disponível no momento.")
+                break
+
+            # Payload 2.2 — tarefa recebida
+            elif task_type == "QUERY":
+                user    = resp.get("USER", "?")
+                task_id = resp.get("TASK_ID", "?")
+                print(f"[TAREFA] Recebida | ID={task_id} | USER={user} | Processando...")
+
+                # Passo 3: simula processamento (1–4 segundos)
+                sleep_time = random.uniform(1, 4)
+                time.sleep(sleep_time)
+
+                # Determina resultado (90% OK, 10% NOK)
+                status = "OK" if random.random() < 0.9 else "NOK"
+
+                # Payload 2.4 — reporta resultado
+                result_payload = {
+                    "STATUS":      status,
+                    "TASK":        "QUERY",
+                    "WORKER_UUID": WORKER_UUID,
+                }
+                # Inclui SERVER_UUID se emprestado
+                if ORIGINAL_SERVER_UUID and master_uuid != ORIGINAL_SERVER_UUID:
+                    result_payload["SERVER_UUID"] = ORIGINAL_SERVER_UUID
+
+                sock.sendall((json.dumps(result_payload) + "\n").encode())
+                print(f"[TAREFA] Resultado enviado: {status} (processado em {sleep_time:.1f}s)")
+
+                # Passo 4: aguarda ACK (Payload 2.5)
+                try:
+                    ack_data = sock.recv(4096).decode()
+                    buf += ack_data
+                    while "\n" in buf:
+                        ack_line, buf = buf.split("\n", 1)
+                        try:
+                            ack = json.loads(ack_line)
+                            if ack.get("STATUS") == "ACK":
+                                print(f"[TAREFA] ACK recebido. Tarefa {task_id} concluída.")
+                        except Exception:
+                            pass
+                except socket.timeout:
+                    print("[TAREFA] Timeout aguardando ACK.")
+                break
+
+    except (ConnectionRefusedError, socket.timeout, OSError) as exc:
+        print(f"[TAREFA] Falha ao conectar ao master: {exc}")
+    except Exception as exc:
+        print(f"[TAREFA] Erro inesperado: {exc}")
+    finally:
+        sock.close()
+        print("[TAREFA] Conexão encerrada.\n")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def start_worker():
@@ -611,6 +731,9 @@ def start_worker():
 
     enviar_heartbeat()
     schedule.every(HEARTBEAT_INTERVAL).seconds.do(enviar_heartbeat)
+
+    pedir_tarefa()
+    schedule.every(TASK_INTERVAL).seconds.do(pedir_tarefa)
 
     try:
         while True:
