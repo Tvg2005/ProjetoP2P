@@ -1,11 +1,19 @@
+import os
 import socket
 import threading
 import json
+from dotenv import load_dotenv
 
-HOST = '10.62.206.24'
-PORT = 8000
+load_dotenv()
 
-SERVER_UUID = 'SRV-MASTER'
+required_env = ["MASTER_IP", "MASTER_PORT", "SERVER_UUID"]
+for name in required_env:
+    if name not in os.environ:
+        raise EnvironmentError(f"Missing required environment variable: {name}")
+
+HOST = os.environ["MASTER_IP"]
+PORT = int(os.environ["MASTER_PORT"])
+SERVER_UUID = os.environ["SERVER_UUID"]
 
 # função para tratar cada conexão
 def handle_client(conn, addr):
@@ -33,13 +41,18 @@ def handle_client(conn, addr):
 
                 # PROTOCOLO HEARTBEAT
                 if task == "HEARTBEAT":
-
                     response = {
                         "SERVER_UUID": SERVER_UUID,
                         "TASK": "HEARTBEAT",
                         "RESPONSE": "ALIVE"
                     }
-
+                    conn.send((json.dumps(response) + "\n").encode())
+                else:
+                    response = {
+                        "SERVER_UUID": SERVER_UUID,
+                        "TASK": "ERROR",
+                        "RESPONSE": "UNKNOWN_TASK"
+                    }
                     conn.send((json.dumps(response) + "\n").encode())
 
     except Exception as e:
