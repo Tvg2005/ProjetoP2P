@@ -1,142 +1,149 @@
 """
-Worker P2P com eleição em DUAS FASES (Two-Phase Deterministic Election)
+Worker P2P — Eleição de master via Bully Algorithm (TCP puro)
 
-Algoritmo:
-  FASE 1 – CAMPAIGN (janela fixa de ELECTION_WINDOW segundos):
-    • Qualquer nó que detecta a queda do master transmite via UDP broadcast
-      e via TCP para todos os peers conhecidos uma mensagem ELECTION com seus
-      dados (UUID, host, port, free_space).
-    • Cada nó que recebe ELECTION entra na eleição (se ainda não estiver) e
-      registra o candidato.
+CONFIGURAÇÃO OBRIGATÓRIA em cada máquina (.env):
+  WORKER_PEERS=<IP_worker2>:<PORTA>,<IP_worker3>:<PORTA>,...
 
-  FASE 2 – DECIDE (ao final da janela):
-    • Todos os nós que participaram ordenam os candidatos pela mesma chave
-      determinística: (-free_space, uuid).
-    • O vencedor é [0] da lista ordenada.
-    • Se este nó for o vencedor → vira master e anuncia NEW_MASTER.
-    • Caso contrário → aguarda o anúncio NEW_MASTER do vencedor com timeout.
-      Se não receber → inicia nova eleição.
+  Inclua os IPs de TODOS os outros workers (pode incluir o próprio IP,
+  ele será ignorado automaticamente).
 
-Garantia: como todos os nós coletam (quase) as mesmas candidaturas e aplicam
-a mesma chave, chegam ao mesmo vencedor de forma independente.
+  Exemplo para 3 workers nas IPs .10, .11, .12 na porta 8000:
+    WORKER_PEERS=192.168.1.10:8000,192.168.1.11:8000,192.168.1.12:8000
+
+  Workes em máquinas DIFERENTES podem usar a MESMA porta (8000 é OK).
+
+COMO FUNCIONA A ELEIÇÃO:
+  1. Um nó detecta que o master caiu (N heartbeats falhos).
+  2. Ele consulta o WORKER_STATUS de todos os peers via TCP.
+  3. Todos os nós aplicam a mesma ordem: (-free_space, uuid) → mesmo vencedor.
+  4. O vencedor vira master e notifica via TCP + UDP broadcast.
+  5. Os demais atualizam o ponteiro para o novo master.
 """
 
 import os
-import socket
 import json
-import time
-import threading
-import subprocess
 import shutil
+import socket
+import subprocess
+import threading
+import time
+
 import schedule
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Variáveis de ambiente ────────────────────────────────────────────────────
-required_env = ["MASTER_IP", "MASTER_PORT", "WORKER_UUID", "WORKER_PORT"]
-for name in required_env:
-    if name not in os.environ:
-        raise EnvironmentError(f"Missing required environment variable: {name}")
+# ── Variáveis de ambiente ─────────────────────────────────────────────────────
 
-MASTER_IP             = os.environ["MASTER_IP"]
-MASTER_PORT           = int(os.environ["MASTER_PORT"])
-WORKER_UUID           = os.environ["WORKER_UUID"]
-_WORKER_HOST_ENV      = os.getenv("WORKER_HOST")
-WORKER_PORT           = int(os.environ["WORKER_PORT"])
-WORKER_PEERS          = os.getenv("WORKER_PEERS", "")
-WORKER_DISCOVERY_ENABLED  = os.getenv("WORKER_DISCOVERY_ENABLED", "true").lower() in ("1","true","yes")
+for _var in ["MASTER_IP", "MASTER_PORT", "WORKER_UUID", "WORKER_PORT"]:
+    if _var not in os.environ:
+        raise EnvironmentError(f"Variável ausente no .env: {_var}")
+
+MASTER_IP        = os.environ["MASTER_IP"]
+MASTER_PORT      = int(os.environ["MASTER_PORT"])
+WORKER_UUID      = os.environ["WORKER_UUID"]
+_WH_ENV          = os.getenv("WORKER_HOST", "")
+WORKER_PORT      = int(os.environ["WORKER_PORT"])
+WORKER_PEERS_STR = os.getenv("WORKER_PEERS", "")
+
+WORKER_DISCOVERY_ENABLED  = os.getenv("WORKER_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes")
 WORKER_BROADCAST_ADDRESS  = os.getenv("WORKER_BROADCAST_ADDRESS", "255.255.255.255")
 WORKER_DISCOVERY_TIMEOUT  = int(os.getenv("WORKER_DISCOVERY_TIMEOUT", "2"))
-HEARTBEAT_THRESHOLD   = int(os.getenv("HEARTBEAT_THRESHOLD", "4"))
-HEARTBEAT_INTERVAL    = int(os.getenv("HEARTBEAT_INTERVAL", "5"))
-WORKER_STATUS_TIMEOUT = int(os.getenv("WORKER_STATUS_TIMEOUT", "3"))
+HEARTBEAT_THRESHOLD       = int(os.getenv("HEARTBEAT_THRESHOLD", "4"))
+HEARTBEAT_INTERVAL        = int(os.getenv("HEARTBEAT_INTERVAL", "5"))
+ELECTION_STATUS_TIMEOUT   = int(os.getenv("ELECTION_STATUS_TIMEOUT", "4"))
+NEW_MASTER_WAIT           = int(os.getenv("NEW_MASTER_WAIT", "12"))
 
-# Janela para coletar candidaturas durante a eleição (segundos)
-ELECTION_WINDOW = int(os.getenv("ELECTION_WINDOW", "4"))
-# Timeout para aguardar o anúncio NEW_MASTER após decidir o vencedor
-NEW_MASTER_WAIT = int(os.getenv("NEW_MASTER_WAIT", "6"))
 
-# ── Utilitários ──────────────────────────────────────────────────────────────
+# ── Helpers de inicialização ──────────────────────────────────────────────────
 
-def parse_worker_peers(peers_str):
-    peers = []
-    for item in peers_str.split(","):
+def _parse_peers(raw: str):
+    out = []
+    for item in raw.split(","):
         item = item.strip()
         if not item or ":" not in item:
             continue
-        host, port = item.split(":", 1)
+        host, port = item.rsplit(":", 1)
         try:
-            peers.append((host.strip(), int(port.strip())))
+            out.append((host.strip(), int(port.strip())))
         except ValueError:
-            continue
-    return peers
+            pass
+    return out
 
 
-def detect_worker_host() -> str:
-    if _WORKER_HOST_ENV:
-        return _WORKER_HOST_ENV
+def _detect_host() -> str:
+    if _WH_ENV:
+        return _WH_ENV
+    for remote in [("8.8.8.8", 80), ("1.1.1.1", 80)]:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(remote)
+                ip = s.getsockname()[0]
+                if ip and not ip.startswith("127."):
+                    return ip
+        except Exception:
+            pass
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            c = s.getsockname()[0]
-            if c and not c.startswith("127."):
-                return c
-    except Exception:
-        pass
-    try:
-        c = socket.gethostbyname(socket.gethostname())
-        if c and not c.startswith("127."):
-            return c
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
     except Exception:
         pass
     return "127.0.0.1"
 
 
-WORKER_PEERS_LIST = parse_worker_peers(WORKER_PEERS)
-WORKER_HOST = detect_worker_host()
-print(f"[CONFIG] WORKER_HOST={WORKER_HOST}  UUID={WORKER_UUID}")
+STATIC_PEERS = _parse_peers(WORKER_PEERS_STR)
+WORKER_HOST  = _detect_host()
+
+print("=" * 60)
+print(f"  Worker iniciando")
+print(f"  UUID : {WORKER_UUID}")
+print(f"  Host : {WORKER_HOST}:{WORKER_PORT}")
+print(f"  Peers estáticos: {STATIC_PEERS or '(nenhum)'}")
+print(f"  Master inicial  : {MASTER_IP}:{MASTER_PORT}")
+print("=" * 60)
+
+if not STATIC_PEERS:
+    print("[AVISO] WORKER_PEERS está vazio! A eleição NÃO funcionará de forma "
+          "confiável sem os IPs dos outros workers configurados.")
 
 
-def get_free_space():
-    return shutil.disk_usage(".").free
+# ── Estado global ─────────────────────────────────────────────────────────────
 
+state_lock = threading.Lock()
 
-# ── Estado global ────────────────────────────────────────────────────────────
-state_lock            = threading.Lock()
-failed_heartbeat_count = 0
-is_master             = False
-master_process        = None          # subprocess do servidor.py se este nó for master
+failed_hb            = 0
+is_master            = False
+election_in_progress = False
+master_proc          = None          # subprocess do servidor.py quando eleito
+new_master_event     = threading.Event()  # sinalizado quando NEW_MASTER chega
 
-# Aponta para o master atual (começa apontando para o master original)
 current_master = {
-    "uuid":       "MASTER",
-    "ip":         MASTER_IP,
-    "port":       MASTER_PORT,
-    "free_space": 0,
+    "uuid": "MASTER",
+    "ip":   MASTER_IP,
+    "port": MASTER_PORT,
 }
 
-# Estado da eleição
-election_in_progress  = False
-election_candidates   = {}            # uuid → {WORKER_UUID, WORKER_HOST, WORKER_PORT, FREE_SPACE}
-election_lock         = threading.Lock()
-new_master_event      = threading.Event()   # sinalizado quando NEW_MASTER é recebido
+# Lista de peers aprendida automaticamente via heartbeat do master.
+# Formato: [(host, port), ...]
+known_peers      = list(STATIC_PEERS)  # começa com peers estáticos (se houver)
+known_peers_lock = threading.Lock()
 
 
-# ── Rede helpers ─────────────────────────────────────────────────────────────
+# ── Primitivas de rede ────────────────────────────────────────────────────────
 
-def send_message(host, port, payload, timeout=3):
+def send_tcp(host: str, port: int, payload: dict, timeout: int = 3):
     """Envia payload JSON via TCP e retorna lista de respostas JSON."""
-    messages = []
+    msgs = []
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect((host, port))
-            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((host, port))
+            s.sendall((json.dumps(payload) + "\n").encode())
             buf = ""
             while True:
                 try:
-                    chunk = sock.recv(4096).decode("utf-8")
+                    chunk = s.recv(4096).decode()
                 except socket.timeout:
                     break
                 if not chunk:
@@ -145,59 +152,83 @@ def send_message(host, port, payload, timeout=3):
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
                     try:
-                        messages.append(json.loads(line))
-                    except json.JSONDecodeError:
+                        msgs.append(json.loads(line))
+                    except Exception:
                         pass
     except Exception:
         pass
-    return messages
+    return msgs
 
 
-def send_udp(payload, addr=None):
-    """Envia payload JSON via UDP. Se addr=None faz broadcast."""
+def send_udp(payload: dict):
+    """Envia payload JSON via UDP broadcast (melhor esforço)."""
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            if addr is None:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                addr = (WORKER_BROADCAST_ADDRESS, WORKER_PORT)
-            sock.sendto(json.dumps(payload).encode("utf-8"), addr)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(json.dumps(payload).encode(),
+                     (WORKER_BROADCAST_ADDRESS, WORKER_PORT))
     except Exception:
         pass
 
 
-# ── Descoberta de peers ──────────────────────────────────────────────────────
+def get_free_space() -> int:
+    return shutil.disk_usage(".").free
 
-def discover_peers():
-    """Retorna lista de (host, port) de workers ativos na rede, excluindo si mesmo."""
-    peers = set(WORKER_PEERS_LIST)
 
+# ── Descoberta de peers ───────────────────────────────────────────────────────
+
+def _update_known_peers(peers_from_master: list):
+    """
+    Atualiza a lista de peers com os dados recebidos do master.
+    peers_from_master: [{uuid, host, port}, ...]
+    """
+    global known_peers
+    updated = set(STATIC_PEERS)  # mantém peers manuais (se existirem)
+    for p in peers_from_master:
+        h, port = p.get("host"), p.get("port")
+        if h and port:
+            updated.add((h, int(port)))
+    with known_peers_lock:
+        known_peers = [(h, p) for h, p in updated
+                       if not (h == WORKER_HOST and p == WORKER_PORT)]
+    if known_peers:
+        print(f"[PEERS] Lista atualizada ({len(known_peers)} peer(s)): "
+              + ", ".join(f"{h}:{p}" for h, p in known_peers))
+
+
+def get_peers():
+    """
+    Retorna lista (host, port) de peers conhecidos, excluindo este nó.
+    Prioridade: peers aprendidos do master > peers estáticos > UDP broadcast.
+    """
+    with known_peers_lock:
+        peers = set(known_peers)
+
+    # UDP broadcast como complemento (melhor esforço)
     if WORKER_DISCOVERY_ENABLED:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 s.settimeout(WORKER_DISCOVERY_TIMEOUT)
-                s.sendto(json.dumps({
-                    "TASK": "DISCOVER_WORKER",
-                    "WORKER_UUID": WORKER_UUID
-                }).encode("utf-8"), (WORKER_BROADCAST_ADDRESS, WORKER_PORT))
-
+                s.sendto(
+                    json.dumps({"TASK": "DISCOVER_WORKER",
+                                "WORKER_UUID": WORKER_UUID}).encode(),
+                    (WORKER_BROADCAST_ADDRESS, WORKER_PORT),
+                )
                 deadline = time.time() + WORKER_DISCOVERY_TIMEOUT
                 while time.time() < deadline:
                     try:
                         data, _ = s.recvfrom(4096)
-                        resp = json.loads(data.decode("utf-8"))
+                        r = json.loads(data.decode())
+                        if (r.get("TASK") == "DISCOVER_RESPONSE"
+                                and r.get("WORKER_UUID") != WORKER_UUID):
+                            h, p = r.get("WORKER_HOST"), r.get("WORKER_PORT")
+                            if h and p:
+                                peers.add((h, int(p)))
                     except socket.timeout:
                         break
                     except Exception:
-                        continue
-                    if resp.get("TASK") != "DISCOVER_RESPONSE":
-                        continue
-                    if resp.get("WORKER_UUID") == WORKER_UUID:
-                        continue
-                    h = resp.get("WORKER_HOST")
-                    p = resp.get("WORKER_PORT")
-                    if h and p:
-                        peers.add((h, int(p)))
+                        pass
         except Exception:
             pass
 
@@ -205,195 +236,147 @@ def discover_peers():
             if not (h == WORKER_HOST and p == WORKER_PORT)]
 
 
-# ── Registro de candidato na eleição ─────────────────────────────────────────
+# ── Eleição (Bully Algorithm adaptado) ───────────────────────────────────────
 
-def _register_candidate(candidate: dict):
+def _election_key(node: dict):
     """
-    Adiciona/atualiza um candidato no dicionário de eleição.
-    Thread-safe. Também garante que este nó esteja na eleição.
+    Chave de ordenação determinística — igual em todos os nós.
+    Vence quem tiver MAIS espaço livre.
+    Em empate, vence UUID menor lexicograficamente (estável).
     """
-    uuid = candidate.get("WORKER_UUID")
-    if not uuid:
-        return
-    with election_lock:
-        election_candidates[uuid] = candidate
-    print(f"[ELECTION] Candidato registrado: {uuid} "
-          f"({candidate.get('WORKER_HOST')}:{candidate.get('WORKER_PORT')}, "
-          f"free={candidate.get('FREE_SPACE', 0) // (1024**3)} GB)")
+    return (-node.get("FREE_SPACE", 0), node.get("WORKER_UUID", ""))
 
 
-def _pick_winner(candidates: list) -> dict:
-    """
-    Critério determinístico e igual para todos os nós:
-      1. Mais espaço livre (maior FREE_SPACE) → vence
-      2. Em empate: UUID menor em ordem lexicográfica → vence (estável)
-    """
-    return sorted(candidates,
-                  key=lambda c: (-c.get("FREE_SPACE", 0), c.get("WORKER_UUID", "")))[0]
-
-
-# ── Eleição em duas fases ────────────────────────────────────────────────────
-
-def _broadcast_candidacy():
-    """Anuncia a candidatura deste nó via UDP broadcast e TCP para todos os peers."""
-    my_candidacy = {
-        "TASK":        "ELECTION",
-        "WORKER_UUID": WORKER_UUID,
-        "WORKER_HOST": WORKER_HOST,
-        "WORKER_PORT": WORKER_PORT,
-        "FREE_SPACE":  get_free_space(),
-    }
-    # UDP broadcast (chega em todos na rede)
-    send_udp(my_candidacy)
-    # TCP direto para peers conhecidos (garante entrega caso broadcast falhe)
-    for host, port in discover_peers():
-        send_message(host, port, my_candidacy, timeout=WORKER_STATUS_TIMEOUT)
+def _query_status(host, port, bucket, lock):
+    """Thread-worker: consulta WORKER_STATUS de um peer e armazena resultado."""
+    responses = send_tcp(
+        host, port,
+        {"TASK": "WORKER_STATUS"},
+        timeout=ELECTION_STATUS_TIMEOUT,
+    )
+    for r in responses:
+        if r.get("TASK") == "WORKER_STATUS_RESPONSE":
+            with lock:
+                bucket.append(r)
 
 
 def start_election():
     """
-    Algoritmo de eleição em duas fases.
-    Deve ser chamado em uma thread separada.
+    Executa o algoritmo Bully:
+      1. Consulta WORKER_STATUS de todos os peers em paralelo (TCP).
+      2. Ordena candidatos pela mesma chave determinística.
+      3. Se este nó for o vencedor → vira master e anuncia.
+      4. Caso contrário → aguarda anúncio do vencedor (com retry).
     """
-    global election_in_progress, failed_heartbeat_count, is_master
+    global election_in_progress, failed_hb
 
-    # ── Guarda de entrada ────────────────────────────────────────────────────
+    # ── Entrada única ────────────────────────────────────────────────────────
     with state_lock:
-        if is_master:
+        if is_master or election_in_progress:
             return
-        if election_in_progress:
-            return       # outra thread já está conduzindo a eleição
         election_in_progress = True
-        failed_heartbeat_count = 0
+        failed_hb = 0
 
-    print("[ELECTION] ──── FASE 1: CAMPAIGN ────")
+    print("[ELECTION] ════ Iniciando eleição ════")
+    new_master_event.clear()
 
-    # Limpa candidatos anteriores e registra a si mesmo
-    with election_lock:
-        election_candidates.clear()
+    # ── Passo 1: coletar status dos peers em paralelo ────────────────────────
+    peers  = get_peers()
+    bucket = []
+    lock   = threading.Lock()
 
-    my_candidacy = {
+    threads = [
+        threading.Thread(target=_query_status, args=(h, p, bucket, lock),
+                         daemon=True)
+        for h, p in peers
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=ELECTION_STATUS_TIMEOUT + 1)
+
+    # Se NEW_MASTER chegou durante a consulta, encerra
+    if new_master_event.is_set():
+        print("[ELECTION] NEW_MASTER recebido durante consulta. Encerrado.")
+        with state_lock:
+            election_in_progress = False
+        return
+
+    # ── Passo 2: determinar vencedor ─────────────────────────────────────────
+    my_info = {
         "WORKER_UUID": WORKER_UUID,
         "WORKER_HOST": WORKER_HOST,
         "WORKER_PORT": WORKER_PORT,
         "FREE_SPACE":  get_free_space(),
     }
-    _register_candidate(my_candidacy)
 
-    # Limpa o evento de novo master antes de começar
-    new_master_event.clear()
+    candidates = [my_info] + bucket
+    candidates.sort(key=_election_key)
+    winner = candidates[0]
 
-    # Transmite candidatura
-    _broadcast_candidacy()
-
-    # ── Aguarda a janela de coleta ───────────────────────────────────────────
-    print(f"[ELECTION] Aguardando {ELECTION_WINDOW}s para coletar candidatos...")
-    got_new_master = new_master_event.wait(timeout=ELECTION_WINDOW)
-
-    if got_new_master:
-        # Outro nó anunciou NEW_MASTER durante a janela → aceita e sai
-        print("[ELECTION] NEW_MASTER recebido durante a janela. Eleição encerrada.")
-        with state_lock:
-            election_in_progress = False
-        return
-
-    # ── FASE 2: DECIDE ───────────────────────────────────────────────────────
-    print("[ELECTION] ──── FASE 2: DECIDE ────")
-
-    with election_lock:
-        candidates = list(election_candidates.values())
-
-    if not candidates:
-        # Nenhum candidato coletado (rede isolada?): auto-elege
-        candidates = [my_candidacy]
-
-    print(f"[ELECTION] Candidatos coletados ({len(candidates)}): "
-          + ", ".join(c['WORKER_UUID'] for c in candidates))
-
-    winner = _pick_winner(candidates)
-    print(f"[ELECTION] Vencedor determinístico: {winner['WORKER_UUID']} "
+    print(f"[ELECTION] Candidatos ({len(candidates)}): "
+          + " | ".join(
+              f"{c['WORKER_UUID']} ({c.get('FREE_SPACE', 0) // (1024**3)} GB)"
+              for c in candidates
+          ))
+    print(f"[ELECTION] Vencedor → {winner['WORKER_UUID']} "
           f"({winner['WORKER_HOST']}:{winner['WORKER_PORT']})")
 
+    # ── Passo 3: agir ────────────────────────────────────────────────────────
     if winner["WORKER_UUID"] == WORKER_UUID:
-        # ── Sou o vencedor ────────────────────────────────────────────────
+        with state_lock:
+            election_in_progress = False
         _become_master()
-        _announce_new_master()
-        with state_lock:
-            election_in_progress = False
+        _notify_new_master()
     else:
-        # ── Não sou o vencedor: aguardo o anúncio do vencedor ─────────────
-        print(f"[ELECTION] Aguardando NEW_MASTER de {winner['WORKER_UUID']} "
-              f"por {NEW_MASTER_WAIT}s...")
         with state_lock:
             election_in_progress = False
-
-        got_announcement = new_master_event.wait(timeout=NEW_MASTER_WAIT)
-        if not got_announcement:
-            print("[ELECTION] Vencedor não anunciou a tempo. Reiniciando eleição...")
+        print(f"[ELECTION] Aguardando anúncio do vencedor ({NEW_MASTER_WAIT}s)…")
+        received = new_master_event.wait(timeout=NEW_MASTER_WAIT)
+        if not received:
+            print("[ELECTION] Vencedor não anunciou. Reiniciando eleição…")
             threading.Thread(target=start_election, daemon=True).start()
 
 
-def _join_election_as_peer(received_candidacy: dict):
-    """
-    Chamado quando este nó recebe uma mensagem ELECTION de outro peer.
-    Registra o candidato e, se ainda não estava na eleição, entra nela.
-    """
-    global election_in_progress
-
-    _register_candidate(received_candidacy)
-
-    with state_lock:
-        already_in = election_in_progress
-        am_master  = is_master
-
-    if am_master or already_in:
-        return  # já está na eleição ou é o master atual
-
-    # Não estava na eleição → entra agora
-    print("[ELECTION] Recebida candidatura de peer. Ingressando na eleição...")
-    threading.Thread(target=start_election, daemon=True).start()
-
-
-# ── Ações de master ──────────────────────────────────────────────────────────
+# ── Ações de quem vira master ─────────────────────────────────────────────────
 
 def _become_master():
-    """Promove este nó a master e lança servidor.py como subprocesso."""
-    global is_master, master_process
+    """Atualiza o estado local e lança servidor.py como subprocesso."""
+    global is_master, master_proc
 
     with state_lock:
         is_master = True
-        current_master["uuid"]       = WORKER_UUID
-        current_master["ip"]         = WORKER_HOST
-        current_master["port"]       = WORKER_PORT
-        current_master["free_space"] = get_free_space()
+        current_master.update({
+            "uuid": WORKER_UUID,
+            "ip":   WORKER_HOST,
+            "port": WORKER_PORT,
+        })
 
-    print(f"[ELECTION] ★ Worker {WORKER_UUID} é o novo MASTER ({WORKER_HOST}:{WORKER_PORT}) ★")
+    print(f"[ELECTION] ★ {WORKER_UUID} é o novo MASTER ({WORKER_HOST}:{WORKER_PORT}) ★")
 
-    # Lança servidor.py com variáveis de ambiente corretas
     env = os.environ.copy()
-    env["MASTER_IP"]   = WORKER_HOST
-    env["MASTER_PORT"] = str(WORKER_PORT)
-    env["SERVER_UUID"] = WORKER_UUID
+    env.update({
+        "MASTER_IP":   WORKER_HOST,
+        "MASTER_PORT": str(WORKER_PORT),
+        "SERVER_UUID": WORKER_UUID,
+    })
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "servidor.py")
 
-    script_dir    = os.path.dirname(os.path.abspath(__file__))
-    servidor_path = os.path.join(script_dir, "servidor.py")
-
-    if os.path.exists(servidor_path):
+    if os.path.exists(script):
         try:
-            master_process = subprocess.Popen(
-                ["python", servidor_path],
-                env=env,
-                cwd=script_dir,
+            master_proc = subprocess.Popen(
+                ["python", script], env=env,
+                cwd=os.path.dirname(script),
             )
-            print(f"[ELECTION] servidor.py iniciado (PID {master_process.pid})")
-        except Exception as e:
-            print(f"[ELECTION] Falha ao iniciar servidor.py: {e}")
+            print(f"[ELECTION] servidor.py iniciado (PID {master_proc.pid})")
+        except Exception as exc:
+            print(f"[ELECTION] Falha ao iniciar servidor.py: {exc}")
     else:
-        print(f"[ELECTION] AVISO: servidor.py não encontrado em {servidor_path}")
+        print(f"[ELECTION] AVISO: servidor.py não encontrado em {script}")
 
 
-def _announce_new_master():
-    """Anuncia a eleição concluída para todos os peers via TCP e UDP."""
+def _notify_new_master():
+    """Notifica todos os peers (TCP + UDP broadcast) sobre o novo master."""
     payload = {
         "TASK":             "NEW_MASTER",
         "MASTER_HOST":      WORKER_HOST,
@@ -401,102 +384,47 @@ def _announce_new_master():
         "MASTER_UUID":      WORKER_UUID,
         "MASTER_FREE_SPACE": get_free_space(),
     }
-
-    peers = set(WORKER_PEERS_LIST)
-    peers.update(discover_peers())
-
-    for host, port in peers:
-        if host == WORKER_HOST and port == WORKER_PORT:
-            continue
-        print(f"[ELECTION] Notificando peer {host}:{port}")
-        send_message(host, port, payload, timeout=WORKER_STATUS_TIMEOUT)
-
-    # Garante via broadcast UDP também
-    send_udp(payload)
-    print("[ELECTION] Anúncio NEW_MASTER concluído.")
+    for h, p in get_peers():
+        print(f"[ELECTION] Notificando {h}:{p}")
+        send_tcp(h, p, payload, timeout=3)
+    send_udp(payload)   # backup / alcança nós que não estão em WORKER_PEERS
+    print("[ELECTION] Notificação de novo master concluída.")
 
 
-def _accept_new_master(master_host, master_port, master_uuid, master_free_space=0):
+def _accept_new_master(host, port, uuid, free_space=0):
     """
-    Aceita um anúncio de novo master (TCP ou UDP).
-    Atualiza o estado local e sinaliza a eleição em andamento.
+    Processa anúncio NEW_MASTER recebido de outro nó.
+    Pode ser chamado de qualquer thread; não segura state_lock ao entrar.
     """
-    global is_master, election_in_progress, failed_heartbeat_count
+    global is_master, election_in_progress, failed_hb
 
-    if not master_host or not master_port or not master_uuid:
+    if not (host and port and uuid):
         return
 
-    print(f"[ELECTION] ✓ Novo master aceito: {master_uuid} em {master_host}:{master_port}")
+    print(f"[ELECTION] ✓ Novo master aceito: {uuid} em {host}:{port}")
 
     with state_lock:
-        # Se este nó se achava master mas recebeu NEW_MASTER de outro → cede
-        if is_master and master_uuid != WORKER_UUID:
-            print("[ELECTION] Este nó cede o título de master para o anunciante.")
+        if is_master and uuid != WORKER_UUID:
+            print("[ELECTION] Este nó cede o título de master.")
             is_master = False
+        election_in_progress = False
+        failed_hb = 0
+        current_master.update({
+            "uuid": uuid,
+            "ip":   host,
+            "port": int(port),
+        })
 
-        election_in_progress   = False
-        failed_heartbeat_count = 0
-        current_master["uuid"]       = master_uuid
-        current_master["ip"]         = master_host
-        current_master["port"]       = int(master_port)
-        current_master["free_space"] = int(master_free_space or 0)
-
-    # Sinaliza threads aguardando NEW_MASTER
-    new_master_event.set()
-
-
-# ── Listener UDP (discovery + election + new_master) ─────────────────────────
-
-def start_discovery_listener():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("0.0.0.0", WORKER_PORT))
-    except Exception as e:
-        print(f"[DISCOVERY] Falha ao bindear UDP porta {WORKER_PORT}: {e}")
-        return
-
-    print(f"[DISCOVERY] Listener UDP ativo na porta {WORKER_PORT}")
-
-    while True:
-        try:
-            data, addr = sock.recvfrom(4096)
-            payload = json.loads(data.decode("utf-8"))
-        except Exception:
-            continue
-
-        task = payload.get("TASK")
-
-        if task == "DISCOVER_WORKER":
-            if payload.get("WORKER_UUID") == WORKER_UUID:
-                continue
-            sock.sendto(json.dumps({
-                "TASK":        "DISCOVER_RESPONSE",
-                "WORKER_UUID": WORKER_UUID,
-                "WORKER_HOST": WORKER_HOST,
-                "WORKER_PORT": WORKER_PORT,
-            }).encode("utf-8"), addr)
-
-        elif task == "ELECTION":
-            if payload.get("WORKER_UUID") != WORKER_UUID:
-                _join_election_as_peer(payload)
-
-        elif task == "NEW_MASTER":
-            _accept_new_master(
-                payload.get("MASTER_HOST"),
-                payload.get("MASTER_PORT"),
-                payload.get("MASTER_UUID"),
-                payload.get("MASTER_FREE_SPACE", 0),
-            )
+    new_master_event.set()   # desbloqueia quem estiver em start_election
 
 
-# ── Status server TCP ────────────────────────────────────────────────────────
+# ── Servidor TCP de status ────────────────────────────────────────────────────
 
-def handle_incoming_connection(conn, addr):
+def _handle_conn(conn, addr):
     buf = ""
     try:
         while True:
-            data = conn.recv(4096).decode("utf-8")
+            data = conn.recv(4096).decode()
             if not data:
                 break
             buf += data
@@ -516,7 +444,7 @@ def handle_incoming_connection(conn, addr):
                         "SERVER_UUID": WORKER_UUID,
                         "TASK":        "HEARTBEAT",
                         "RESPONSE":    "ALIVE" if am_master else "NOT_MASTER",
-                    }) + "\n").encode("utf-8"))
+                    }) + "\n").encode())
 
                 elif task == "WORKER_STATUS":
                     conn.sendall((json.dumps({
@@ -525,15 +453,7 @@ def handle_incoming_connection(conn, addr):
                         "WORKER_HOST": WORKER_HOST,
                         "WORKER_PORT": WORKER_PORT,
                         "FREE_SPACE":  get_free_space(),
-                    }) + "\n").encode("utf-8"))
-
-                elif task == "ELECTION":
-                    if payload.get("WORKER_UUID") != WORKER_UUID:
-                        _join_election_as_peer(payload)
-                    conn.sendall((json.dumps({
-                        "TASK":     "ELECTION_ACK",
-                        "RESPONSE": "REGISTERED",
-                    }) + "\n").encode("utf-8"))
+                    }) + "\n").encode())
 
                 elif task == "NEW_MASTER":
                     _accept_new_master(
@@ -543,38 +463,76 @@ def handle_incoming_connection(conn, addr):
                         payload.get("MASTER_FREE_SPACE", 0),
                     )
                     conn.sendall((json.dumps({
-                        "TASK":     "NEW_MASTER_ACK",
-                        "RESPONSE": "RECEIVED",
-                    }) + "\n").encode("utf-8"))
+                        "TASK": "NEW_MASTER_ACK", "RESPONSE": "RECEIVED",
+                    }) + "\n").encode())
 
                 else:
                     conn.sendall((json.dumps({
-                        "TASK":     "ERROR",
-                        "RESPONSE": "UNKNOWN_TASK",
-                    }) + "\n").encode("utf-8"))
+                        "TASK": "ERROR", "RESPONSE": "UNKNOWN_TASK",
+                    }) + "\n").encode())
 
-    except Exception as e:
-        print(f"[STATUS] Erro em {addr}: {e}")
+    except Exception as exc:
+        print(f"[STATUS] Erro em {addr}: {exc}")
     finally:
         conn.close()
 
 
-def start_status_server():
+def _start_status_server():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((WORKER_HOST, WORKER_PORT))
     srv.listen()
-    print(f"[STATUS] Servidor TCP ativo em {WORKER_HOST}:{WORKER_PORT}")
+    print(f"[STATUS] Servidor TCP em {WORKER_HOST}:{WORKER_PORT}")
     while True:
         conn, addr = srv.accept()
-        threading.Thread(target=handle_incoming_connection,
-                         args=(conn, addr), daemon=True).start()
+        threading.Thread(target=_handle_conn, args=(conn, addr),
+                         daemon=True).start()
 
 
-# ── Heartbeat ────────────────────────────────────────────────────────────────
+# ── Listener UDP (discovery + NEW_MASTER via broadcast) ──────────────────────
+
+def _start_udp_listener():
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", WORKER_PORT))
+        print(f"[DISCOVERY] Listener UDP em porta {WORKER_PORT}")
+    except Exception as exc:
+        print(f"[DISCOVERY] Falha ao abrir UDP: {exc}")
+        return
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+            payload = json.loads(data.decode())
+        except Exception:
+            continue
+
+        task = payload.get("TASK")
+
+        if task == "DISCOVER_WORKER":
+            if payload.get("WORKER_UUID") == WORKER_UUID:
+                continue
+            sock.sendto(json.dumps({
+                "TASK":        "DISCOVER_RESPONSE",
+                "WORKER_UUID": WORKER_UUID,
+                "WORKER_HOST": WORKER_HOST,
+                "WORKER_PORT": WORKER_PORT,
+            }).encode(), addr)
+
+        elif task == "NEW_MASTER":
+            _accept_new_master(
+                payload.get("MASTER_HOST"),
+                payload.get("MASTER_PORT"),
+                payload.get("MASTER_UUID"),
+                payload.get("MASTER_FREE_SPACE", 0),
+            )
+
+
+# ── Heartbeat ─────────────────────────────────────────────────────────────────
 
 def enviar_heartbeat():
-    global failed_heartbeat_count
+    global failed_hb
 
     with state_lock:
         if is_master:
@@ -588,73 +546,68 @@ def enviar_heartbeat():
     try:
         sock.connect((master_ip, master_port))
         print(f"[HEARTBEAT] Conectado ao master {master_ip}:{master_port}")
-
+        # Inclui host+port para o master registrar este worker
         sock.sendall((json.dumps({
-            "SERVER_UUID": WORKER_UUID,
             "WORKER_UUID": WORKER_UUID,
+            "WORKER_HOST": WORKER_HOST,
+            "WORKER_PORT": WORKER_PORT,
             "TASK":        "HEARTBEAT",
-        }) + "\n").encode("utf-8"))
+        }) + "\n").encode())
 
         buf  = ""
-        data = sock.recv(4096).decode("utf-8")
-
+        data = sock.recv(4096).decode()
         if not data:
-            raise ConnectionError("Sem resposta do master.")
+            raise ConnectionError("Sem resposta.")
 
         buf += data
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
             try:
                 resp = json.loads(line)
-            except json.JSONDecodeError:
+            except Exception:
                 continue
 
-            response_val = resp.get("RESPONSE")
-            print(f"[HEARTBEAT] Resposta: {response_val}")
+            r = resp.get("RESPONSE")
+            print(f"[HEARTBEAT] Resposta: {r}")
 
-            if response_val == "ALIVE":
+            if r == "ALIVE":
                 with state_lock:
-                    failed_heartbeat_count = 0
-                    election_in_progress   = False
+                    failed_hb = 0
+                    election_in_progress = False
+                # Atualiza a lista de peers com os dados do master
+                peers_from_master = resp.get("PEERS", [])
+                if peers_from_master:
+                    _update_known_peers(peers_from_master)
 
-            elif response_val == "NOT_MASTER":
-                # Conectamos a um worker que não é mais master
-                print("[HEARTBEAT] Resposta NOT_MASTER – iniciando eleição.")
+            elif r == "NOT_MASTER":
+                print("[HEARTBEAT] Nó respondeu NOT_MASTER → eleição.")
                 with state_lock:
-                    failed_heartbeat_count = HEARTBEAT_THRESHOLD
+                    failed_hb = HEARTBEAT_THRESHOLD
                 threading.Thread(target=start_election, daemon=True).start()
 
-    except (ConnectionRefusedError, socket.timeout, ConnectionError, OSError) as e:
+    except (ConnectionRefusedError, socket.timeout, ConnectionError, OSError) as exc:
         with state_lock:
-            failed_heartbeat_count += 1
-            failures = failed_heartbeat_count
-        print(f"[HEARTBEAT] Falha #{failures}/{HEARTBEAT_THRESHOLD} "
-              f"com master {master_ip}:{master_port} – {e}")
-
-        if failures >= HEARTBEAT_THRESHOLD:
+            failed_hb += 1
+            count = failed_hb
+        print(f"[HEARTBEAT] Falha {count}/{HEARTBEAT_THRESHOLD} "
+              f"com {master_ip}:{master_port} — {exc}")
+        if count >= HEARTBEAT_THRESHOLD:
             threading.Thread(target=start_election, daemon=True).start()
 
-    except Exception as e:
-        print(f"[HEARTBEAT] Erro inesperado: {e}")
+    except Exception as exc:
+        print(f"[HEARTBEAT] Erro inesperado: {exc}")
     finally:
         sock.close()
-        print("[HEARTBEAT] Conexão encerrada.\n")
+        print("[HEARTBEAT] Encerrado.\n")
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def start_worker():
-    print("=" * 60)
-    print(f"  Worker {WORKER_UUID} iniciando")
-    print(f"  Host: {WORKER_HOST}:{WORKER_PORT}")
-    print(f"  Master inicial: {MASTER_IP}:{MASTER_PORT}")
-    print("=" * 60)
+    threading.Thread(target=_start_udp_listener, daemon=True).start()
+    threading.Thread(target=_start_status_server, daemon=True).start()
 
-    threading.Thread(target=start_discovery_listener, daemon=True).start()
-    threading.Thread(target=start_status_server,      daemon=True).start()
-
-    # Aguarda os servidores subirem antes do primeiro heartbeat
-    time.sleep(1)
+    time.sleep(1)   # aguarda servidores subirem
 
     enviar_heartbeat()
     schedule.every(HEARTBEAT_INTERVAL).seconds.do(enviar_heartbeat)
@@ -664,7 +617,7 @@ def start_worker():
             schedule.run_pending()
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[ENCERRANDO] Worker desligado pelo usuário.")
+        print("\n[ENCERRANDO] Worker desligado.")
 
 
 if __name__ == "__main__":
