@@ -2,15 +2,15 @@
 Worker P2P — Eleição de master via Bully Algorithm (TCP puro)
 
 CONFIGURAÇÃO OBRIGATÓRIA em cada máquina (.env):
-  WORKER_PEERS=<IP_worker2>:<PORTA>,<IP_worker3>:<PORTA>,...
+  SERVER_UUID=<uuid-do-master>   ← mesmo valor usado no servidor
+  WORKER_UUID=<uuid-deste-worker>
+  MASTER_PORT=<porta-tcp-do-master>
+  WORKER_PORT=<porta-tcp-deste-worker>
 
-  Inclua os IPs de TODOS os outros workers (pode incluir o próprio IP,
-  ele será ignorado automaticamente).
+  O IP do master é descoberto AUTOMATICAMENTE via broadcast UDP.
+  Não é necessário configurar MASTER_IP.
 
-  Exemplo para 3 workers nas IPs .10, .11, .12 na porta 8000:
-    WORKER_PEERS=192.168.1.10:8000,192.168.1.11:8000,192.168.1.12:8000
-
-  Workes em máquinas DIFERENTES podem usar a MESMA porta (8000 é OK).
+  DISCOVERY_PORT (opcional, padrão = MASTER_PORT+1): porta UDP de descoberta.
 
 COMO FUNCIONA A ELEIÇÃO:
   1. Um nó detecta que o master caiu (N heartbeats falhos).
@@ -35,11 +35,10 @@ load_dotenv()
 
 # ── Variáveis de ambiente ─────────────────────────────────────────────────────
 
-for _var in ["MASTER_IP", "MASTER_PORT", "WORKER_UUID", "WORKER_PORT"]:
+for _var in ["MASTER_PORT", "SERVER_UUID", "WORKER_UUID", "WORKER_PORT"]:
     if _var not in os.environ:
         raise EnvironmentError(f"Variável ausente no .env: {_var}")
 
-MASTER_IP        = os.environ["MASTER_IP"]
 MASTER_PORT      = int(os.environ["MASTER_PORT"])
 WORKER_UUID      = os.environ["WORKER_UUID"]
 _WH_ENV          = os.getenv("WORKER_HOST", "")
@@ -55,8 +54,11 @@ ELECTION_STATUS_TIMEOUT   = int(os.getenv("ELECTION_STATUS_TIMEOUT", "4"))
 NEW_MASTER_WAIT           = int(os.getenv("NEW_MASTER_WAIT", "12"))
 TASK_INTERVAL             = int(os.getenv("TASK_INTERVAL", "10"))
 
-# UUID do master original configurado no .env (usado para detectar "Emprestado")
+# UUID do master alvo — usado na descoberta por broadcast e para detectar "Emprestado"
 ORIGINAL_SERVER_UUID = os.getenv("SERVER_UUID", "")
+
+# Porta UDP de descoberta do master (deve coincidir com o servidor)
+DISCOVERY_PORT = int(os.getenv("DISCOVERY_PORT", str(MASTER_PORT + 1)))
 
 
 # ── Helpers de inicialização ──────────────────────────────────────────────────
@@ -104,11 +106,63 @@ print(f"  Worker iniciando")
 print(f"  UUID : {WORKER_UUID}")
 print(f"  Host : {WORKER_HOST}:{WORKER_PORT}")
 print(f"  Peers estáticos: {STATIC_PEERS or '(nenhum)'}")
-print(f"  Master inicial  : {MASTER_IP}:{MASTER_PORT}")
+print(f"  Master UUID alvo: {ORIGINAL_SERVER_UUID or '(qualquer)'}")
+print(f"  Descoberta via broadcast na porta UDP {DISCOVERY_PORT}")
 print("=" * 60)
 
 if not STATIC_PEERS:
     print("[INFO] WORKER_PEERS vazio — peers serão aprendidos automaticamente via master.")
+
+
+# ── Descoberta do master por broadcast UDP ────────────────────────────────────
+
+def discover_master(retries: int = 3, timeout: float = 3.0) -> tuple[str, int] | None:
+    """
+    Envia FIND_MASTER via broadcast UDP e aguarda resposta MASTER_FOUND
+    com o IP real do servidor que possui o SERVER_UUID procurado.
+    Retorna (ip, port) ou None se não encontrar.
+    """
+    request = json.dumps({
+        "TASK":        "FIND_MASTER",
+        "SERVER_UUID": ORIGINAL_SERVER_UUID,
+        "WORKER_UUID": WORKER_UUID,
+    }).encode()
+
+    for attempt in range(1, retries + 1):
+        print(f"[DISCOVERY] Tentativa {attempt}/{retries} — "
+              f"broadcast FIND_MASTER (UUID={ORIGINAL_SERVER_UUID or 'qualquer'})")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.settimeout(timeout)
+                s.sendto(request, (WORKER_BROADCAST_ADDRESS, DISCOVERY_PORT))
+
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    try:
+                        data, addr = s.recvfrom(4096)
+                        resp = json.loads(data.decode())
+                        if resp.get("TASK") != "MASTER_FOUND":
+                            continue
+                        # Aceita qualquer UUID ou o UUID exato procurado
+                        if (ORIGINAL_SERVER_UUID
+                                and resp.get("SERVER_UUID") != ORIGINAL_SERVER_UUID):
+                            continue
+                        ip   = resp.get("MASTER_IP")
+                        port = resp.get("MASTER_PORT", MASTER_PORT)
+                        if ip:
+                            print(f"[DISCOVERY] Master encontrado: {ip}:{port} "
+                                  f"(UUID={resp.get('SERVER_UUID')})")
+                            return (ip, int(port))
+                    except socket.timeout:
+                        break
+                    except Exception:
+                        pass
+        except Exception as exc:
+            print(f"[DISCOVERY] Erro no broadcast: {exc}")
+
+    print("[DISCOVERY] Master não encontrado via broadcast.")
+    return None
 
 
 # ── Estado global ─────────────────────────────────────────────────────────────
@@ -122,8 +176,8 @@ master_proc          = None          # subprocess do servidor.py quando eleito
 new_master_event     = threading.Event()  # sinalizado quando NEW_MASTER chega
 
 current_master = {
-    "uuid": "MASTER",
-    "ip":   MASTER_IP,
+    "uuid": ORIGINAL_SERVER_UUID or "MASTER",
+    "ip":   None,   # preenchido pela descoberta via broadcast
     "port": MASTER_PORT,
 }
 
@@ -728,6 +782,21 @@ def start_worker():
     threading.Thread(target=_start_status_server, daemon=True).start()
 
     time.sleep(1)   # aguarda servidores subirem
+
+    # ── Descoberta do master via broadcast UDP ────────────────────────────────
+    print("[WORKER] Buscando master via broadcast UDP...")
+    result = discover_master(retries=5, timeout=3.0)
+    if result is None:
+        print("[WORKER] ERRO: Não foi possível encontrar o master na rede.")
+        print("[WORKER] Verifique se o servidor está rodando e acessível via broadcast.")
+        raise SystemExit(1)
+
+    discovered_ip, discovered_port = result
+    with state_lock:
+        current_master["ip"]   = discovered_ip
+        current_master["port"] = discovered_port
+    print(f"[WORKER] Master configurado: {discovered_ip}:{discovered_port}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     enviar_heartbeat()
     schedule.every(HEARTBEAT_INTERVAL).seconds.do(enviar_heartbeat)

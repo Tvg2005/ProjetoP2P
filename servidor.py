@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-for _v in ["MASTER_IP", "MASTER_PORT", "SERVER_UUID"]:
+for _v in ["MASTER_PORT", "SERVER_UUID"]:
     if _v not in os.environ:
         raise EnvironmentError(f"Variável ausente: {_v}")
 
@@ -17,7 +17,35 @@ HOST        = "0.0.0.0"
 PORT        = int(os.environ["MASTER_PORT"])
 SERVER_UUID = os.environ["SERVER_UUID"]
 
+# Porta UDP para descoberta do master por broadcast (SERVER_UUID)
+DISCOVERY_PORT           = int(os.getenv("DISCOVERY_PORT", str(PORT + 1)))
+BROADCAST_RESPONSE_ADDR  = os.getenv("WORKER_BROADCAST_ADDRESS", "255.255.255.255")
+
 WORKER_STALE_TIMEOUT = int(os.getenv("WORKER_STALE_TIMEOUT", "30"))
+
+
+def _detect_local_ip() -> str:
+    """Detecta o IP local da máquina (não 127.x)."""
+    for remote in [("8.8.8.8", 80), ("1.1.1.1", 80)]:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(remote)
+                ip = s.getsockname()[0]
+                if ip and not ip.startswith("127."):
+                    return ip
+        except Exception:
+            pass
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+SERVER_HOST = _detect_local_ip()
+print(f"[MASTER] IP detectado automaticamente: {SERVER_HOST}")
 
 # ── Registro de workers ───────────────────────────────────────────────────────
 # { worker_uuid: {uuid, host, port, last_seen} }
@@ -192,16 +220,69 @@ def handle_client(conn, addr):
         print(f"[MASTER] Conexão encerrada: {addr}")
 
 
+# ── Listener UDP de descoberta do master ─────────────────────────────────────
+
+def _start_discovery_listener():
+    """
+    Escuta broadcasts UDP na DISCOVERY_PORT.
+    Quando recebe FIND_MASTER com SERVER_UUID correto,
+    responde com o IP real do servidor para que o cliente conecte.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", DISCOVERY_PORT))
+        print(f"[DISCOVERY] Listener UDP na porta {DISCOVERY_PORT} "
+              f"(UUID={SERVER_UUID})")
+    except Exception as exc:
+        print(f"[DISCOVERY] Falha ao abrir socket UDP: {exc}")
+        return
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+            payload = json.loads(data.decode())
+        except Exception:
+            continue
+
+        if payload.get("TASK") != "FIND_MASTER":
+            continue
+
+        requested_uuid = payload.get("SERVER_UUID", "")
+        if requested_uuid and requested_uuid != SERVER_UUID:
+            # Não é para este servidor
+            continue
+
+        print(f"[DISCOVERY] Requisição FIND_MASTER de {addr} "
+              f"(UUID={requested_uuid or 'qualquer'})")
+
+        response = json.dumps({
+            "TASK":        "MASTER_FOUND",
+            "SERVER_UUID": SERVER_UUID,
+            "MASTER_IP":   SERVER_HOST,
+            "MASTER_PORT": PORT,
+        }).encode()
+        try:
+            sock.sendto(response, addr)
+            print(f"[DISCOVERY] Respondido para {addr}: {SERVER_HOST}:{PORT}")
+        except Exception as exc:
+            print(f"[DISCOVERY] Erro ao responder: {exc}")
+
+
 # ── Start ─────────────────────────────────────────────────────────────────────
 
 def start_server():
+    # Inicia listener UDP de descoberta em thread daemon
+    threading.Thread(target=_start_discovery_listener, daemon=True).start()
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
     srv.listen()
 
-    print(f"[MASTER] Servidor iniciado na porta {PORT}")
+    print(f"[MASTER] Servidor TCP iniciado na porta {PORT}")
     print(f"[MASTER] UUID: {SERVER_UUID}")
+    print(f"[MASTER] IP: {SERVER_HOST}")
 
     while True:
         conn, addr = srv.accept()
