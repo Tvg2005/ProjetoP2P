@@ -43,7 +43,8 @@ MASTER_PORT      = int(os.environ["MASTER_PORT"])
 WORKER_UUID      = os.environ["WORKER_UUID"]
 _WH_ENV          = os.getenv("WORKER_HOST", "")
 WORKER_PORT      = int(os.environ["WORKER_PORT"])
-WORKER_PEERS_STR = os.getenv("WORKER_PEERS", "")
+# [LEGADO] WORKER_PEERS_STR — peers estáticos; eleição agora usa broadcast
+# WORKER_PEERS_STR = os.getenv("WORKER_PEERS", "")
 
 WORKER_DISCOVERY_ENABLED  = os.getenv("WORKER_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes")
 _BROADCAST_ENV            = os.getenv("WORKER_BROADCAST_ADDRESS", "")
@@ -60,21 +61,26 @@ ORIGINAL_SERVER_UUID = os.getenv("SERVER_UUID", "")
 # Porta UDP de descoberta do master (deve coincidir com o servidor)
 DISCOVERY_PORT = int(os.getenv("DISCOVERY_PORT", str(MASTER_PORT + 1)))
 
+# Eleição via broadcast — tempos configuráveis
+ELECTION_DELAY           = int(os.getenv("ELECTION_DELAY", "30"))   # espera antes de eleger
+ELECTION_COLLECT_TIMEOUT = int(os.getenv("ELECTION_COLLECT_TIMEOUT", "5"))  # janela de coleta
+
 
 # ── Helpers de inicialização ──────────────────────────────────────────────────
 
-def _parse_peers(raw: str):
-    out = []
-    for item in raw.split(","):
-        item = item.strip()
-        if not item or ":" not in item:
-            continue
-        host, port = item.rsplit(":", 1)
-        try:
-            out.append((host.strip(), int(port.strip())))
-        except ValueError:
-            pass
-    return out
+# [LEGADO] _parse_peers — não usado com eleição via broadcast
+# def _parse_peers(raw: str):
+#     out = []
+#     for item in raw.split(","):
+#         item = item.strip()
+#         if not item or ":" not in item:
+#             continue
+#         host, port = item.rsplit(":", 1)
+#         try:
+#             out.append((host.strip(), int(port.strip())))
+#         except ValueError:
+#             pass
+#     return out
 
 
 def _detect_host() -> str:
@@ -112,21 +118,20 @@ def _detect_broadcast(local_ip: str) -> str:
     return f"{prefix}.255"
 
 
-STATIC_PEERS           = _parse_peers(WORKER_PEERS_STR)
-WORKER_HOST            = _detect_host()
+# [LEGADO] STATIC_PEERS — peers estáticos; eleição agora via broadcast
+# STATIC_PEERS = _parse_peers(WORKER_PEERS_STR)
+WORKER_HOST              = _detect_host()
 WORKER_BROADCAST_ADDRESS = _detect_broadcast(WORKER_HOST)
 
 print("=" * 60)
 print(f"  Worker iniciando")
 print(f"  UUID : {WORKER_UUID}")
 print(f"  Host : {WORKER_HOST}:{WORKER_PORT}")
-print(f"  Peers estáticos: {STATIC_PEERS or '(nenhum)'}")
 print(f"  Master UUID alvo: {ORIGINAL_SERVER_UUID or '(qualquer)'}")
-print(f"  Broadcast (descoberta): {WORKER_BROADCAST_ADDRESS}:{DISCOVERY_PORT}")
+print(f"  Broadcast master : {WORKER_BROADCAST_ADDRESS}:{DISCOVERY_PORT}")
+print(f"  Broadcast eleição: {WORKER_BROADCAST_ADDRESS}:{WORKER_PORT}")
+print(f"  ELECTION_DELAY   : {ELECTION_DELAY}s")
 print("=" * 60)
-
-if not STATIC_PEERS:
-    print("[INFO] WORKER_PEERS vazio — peers serão aprendidos automaticamente via master.")
 
 
 # ── Descoberta do master por broadcast UDP ────────────────────────────────────
@@ -196,9 +201,9 @@ current_master = {
     "port": MASTER_PORT,
 }
 
-# Lista de peers aprendida automaticamente via heartbeat do master.
-# Formato: [(host, port), ...]
-known_peers      = list(STATIC_PEERS)  # começa com peers estáticos (se houver)
+# [LEGADO] known_peers — workers não conhecem peers; eleição agora via broadcast
+# Mantido para compatibilidade com código legado comentado abaixo.
+known_peers      = []   # workers não conhecem peers antes do master cair
 known_peers_lock = threading.Lock()
 
 
@@ -247,65 +252,52 @@ def get_free_space() -> int:
     return shutil.disk_usage(".").free
 
 
-# ── Descoberta de peers ───────────────────────────────────────────────────────
-
-def _update_known_peers(peers_from_master: list):
-    """
-    Atualiza a lista de peers com os dados recebidos do master.
-    peers_from_master: [{uuid, host, port}, ...]
-    """
-    global known_peers
-    updated = set(STATIC_PEERS)  # mantém peers manuais (se existirem)
-    for p in peers_from_master:
-        h, port = p.get("host"), p.get("port")
-        if h and port:
-            updated.add((h, int(port)))
-    with known_peers_lock:
-        known_peers = [(h, p) for h, p in updated
-                       if not (h == WORKER_HOST and p == WORKER_PORT)]
-    if known_peers:
-        print(f"[PEERS] Lista atualizada ({len(known_peers)} peer(s)): "
-              + ", ".join(f"{h}:{p}" for h, p in known_peers))
-
-
-def get_peers():
-    """
-    Retorna lista (host, port) de peers conhecidos, excluindo este nó.
-    Prioridade: peers aprendidos do master > peers estáticos > UDP broadcast.
-    """
-    with known_peers_lock:
-        peers = set(known_peers)
-
-    # UDP broadcast como complemento (melhor esforço)
-    if WORKER_DISCOVERY_ENABLED:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                s.settimeout(WORKER_DISCOVERY_TIMEOUT)
-                s.sendto(
-                    json.dumps({"TASK": "DISCOVER_WORKER",
-                                "WORKER_UUID": WORKER_UUID}).encode(),
-                    (WORKER_BROADCAST_ADDRESS, WORKER_PORT),
-                )
-                deadline = time.time() + WORKER_DISCOVERY_TIMEOUT
-                while time.time() < deadline:
-                    try:
-                        data, _ = s.recvfrom(4096)
-                        r = json.loads(data.decode())
-                        if (r.get("TASK") == "DISCOVER_RESPONSE"
-                                and r.get("WORKER_UUID") != WORKER_UUID):
-                            h, p = r.get("WORKER_HOST"), r.get("WORKER_PORT")
-                            if h and p:
-                                peers.add((h, int(p)))
-                    except socket.timeout:
-                        break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    return [(h, p) for h, p in peers
-            if not (h == WORKER_HOST and p == WORKER_PORT)]
+# ── [LEGADO] Descoberta de peers via master ───────────────────────────────────
+# Workers não conhecem peers entre si enquanto o master está ativo.
+# A eleição agora usa broadcast UDP direto (start_election_broadcast abaixo).
+#
+# def _update_known_peers(peers_from_master: list):
+#     global known_peers
+#     updated = set()  # sem STATIC_PEERS
+#     for p in peers_from_master:
+#         h, port = p.get("host"), p.get("port")
+#         if h and port:
+#             updated.add((h, int(port)))
+#     with known_peers_lock:
+#         known_peers = [(h, p) for h, p in updated
+#                        if not (h == WORKER_HOST and p == WORKER_PORT)]
+#
+# def get_peers():
+#     with known_peers_lock:
+#         peers = set(known_peers)
+#     if WORKER_DISCOVERY_ENABLED:
+#         try:
+#             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+#                 s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+#                 s.settimeout(WORKER_DISCOVERY_TIMEOUT)
+#                 s.sendto(
+#                     json.dumps({"TASK": "DISCOVER_WORKER",
+#                                 "WORKER_UUID": WORKER_UUID}).encode(),
+#                     (WORKER_BROADCAST_ADDRESS, WORKER_PORT),
+#                 )
+#                 deadline = time.time() + WORKER_DISCOVERY_TIMEOUT
+#                 while time.time() < deadline:
+#                     try:
+#                         data, _ = s.recvfrom(4096)
+#                         r = json.loads(data.decode())
+#                         if (r.get("TASK") == "DISCOVER_RESPONSE"
+#                                 and r.get("WORKER_UUID") != WORKER_UUID):
+#                             h, p = r.get("WORKER_HOST"), r.get("WORKER_PORT")
+#                             if h and p:
+#                                 peers.add((h, int(p)))
+#                     except socket.timeout:
+#                         break
+#                     except Exception:
+#                         pass
+#         except Exception:
+#             pass
+#     return [(h, p) for h, p in peers
+#             if not (h == WORKER_HOST and p == WORKER_PORT)]
 
 
 # ── Eleição (Bully Algorithm adaptado) ───────────────────────────────────────
@@ -319,70 +311,119 @@ def _election_key(node: dict):
     return (-node.get("FREE_SPACE", 0), node.get("WORKER_UUID", ""))
 
 
-def _query_status(host, port, bucket, lock):
-    """Thread-worker: consulta WORKER_STATUS de um peer e armazena resultado."""
-    responses = send_tcp(
-        host, port,
-        {"TASK": "WORKER_STATUS"},
-        timeout=ELECTION_STATUS_TIMEOUT,
-    )
-    for r in responses:
-        if r.get("TASK") == "WORKER_STATUS_RESPONSE":
-            with lock:
-                bucket.append(r)
+# ── [LEGADO] Eleição via TCP/peers (Bully Algorithm com peers conhecidos) ───────────
+# Substituiído por start_election_broadcast (eleição via broadcast UDP puro).
+#
+# def _query_status(host, port, bucket, lock):
+#     responses = send_tcp(host, port, {"TASK": "WORKER_STATUS"}, timeout=ELECTION_STATUS_TIMEOUT)
+#     for r in responses:
+#         if r.get("TASK") == "WORKER_STATUS_RESPONSE":
+#             with lock:
+#                 bucket.append(r)
+#
+# def start_election():
+#     global election_in_progress, failed_hb
+#     with state_lock:
+#         if is_master or election_in_progress:
+#             return
+#         election_in_progress = True
+#         failed_hb = 0
+#     print("[ELECTION] ════ Iniciando eleição [LEGADO] ════")
+#     new_master_event.clear()
+#     peers  = get_peers()
+#     bucket = []
+#     lock   = threading.Lock()
+#     threads = [threading.Thread(target=_query_status, args=(h, p, bucket, lock), daemon=True)
+#                for h, p in peers]
+#     for t in threads: t.start()
+#     for t in threads: t.join(timeout=ELECTION_STATUS_TIMEOUT + 1)
+#     if new_master_event.is_set():
+#         with state_lock: election_in_progress = False
+#         return
+#     my_info = {"WORKER_UUID": WORKER_UUID, "WORKER_HOST": WORKER_HOST,
+#                "WORKER_PORT": WORKER_PORT, "FREE_SPACE": get_free_space()}
+#     candidates = [my_info] + bucket
+#     candidates.sort(key=_election_key)
+#     winner = candidates[0]
+#     if winner["WORKER_UUID"] == WORKER_UUID:
+#         with state_lock: election_in_progress = False
+#         _become_master()
+#         _notify_new_master()
+#     else:
+#         with state_lock: election_in_progress = False
+#         received = new_master_event.wait(timeout=NEW_MASTER_WAIT)
+#         if not received:
+#             threading.Thread(target=start_election, daemon=True).start()
 
 
-def start_election():
+# ── Eleição via broadcast UDP (sem conhecimento prévio de peers) ────────────────
+
+def start_election_broadcast():
     """
-    Executa o algoritmo Bully:
-      1. Consulta WORKER_STATUS de todos os peers em paralelo (TCP).
-      2. Ordena candidatos pela mesma chave determinística.
-      3. Se este nó for o vencedor → vira master e anuncia.
-      4. Caso contrário → aguarda anúncio do vencedor (com retry).
+    Eleição via broadcast UDP puro — workers não precisam conhecer peers:
+      1. Envia ELECTION_BROADCAST na subrede e coleta ELECTION_RESPONSE.
+      2. Adiciona o próprio nó como candidato.
+      3. Ordena pelos mesmos critérios determinísticos (- free_space, uuid).
+      4. Vencedor vira master e anuncia via broadcast; demais aguardam NEW_MASTER.
     """
     global election_in_progress, failed_hb
 
-    # ── Entrada única ────────────────────────────────────────────────────────
     with state_lock:
         if is_master or election_in_progress:
             return
         election_in_progress = True
         failed_hb = 0
 
-    print("[ELECTION] ════ Iniciando eleição ════")
+    print("[ELECTION] ════ Iniciando eleição via broadcast UDP ════")
     new_master_event.clear()
 
-    # ── Passo 1: coletar status dos peers em paralelo ────────────────────────
-    peers  = get_peers()
-    bucket = []
-    lock   = threading.Lock()
-
-    threads = [
-        threading.Thread(target=_query_status, args=(h, p, bucket, lock),
-                         daemon=True)
-        for h, p in peers
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=ELECTION_STATUS_TIMEOUT + 1)
-
-    # Se NEW_MASTER chegou durante a consulta, encerra
-    if new_master_event.is_set():
-        print("[ELECTION] NEW_MASTER recebido durante consulta. Encerrado.")
-        with state_lock:
-            election_in_progress = False
-        return
-
-    # ── Passo 2: determinar vencedor ─────────────────────────────────────────
     my_info = {
         "WORKER_UUID": WORKER_UUID,
         "WORKER_HOST": WORKER_HOST,
         "WORKER_PORT": WORKER_PORT,
         "FREE_SPACE":  get_free_space(),
     }
+    candidates = [my_info]
 
-    candidates = [my_info] + bucket
+    broadcast_target = (WORKER_BROADCAST_ADDRESS, WORKER_PORT)
+    print(f"[ELECTION] Enviando ELECTION_BROADCAST → {broadcast_target}")
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.settimeout(ELECTION_COLLECT_TIMEOUT)
+            s.sendto(json.dumps({
+                "TASK":        "ELECTION_BROADCAST",
+                "WORKER_UUID": WORKER_UUID,
+                "WORKER_HOST": WORKER_HOST,
+                "WORKER_PORT": WORKER_PORT,
+                "FREE_SPACE":  get_free_space(),
+            }).encode(), broadcast_target)
+
+            deadline = time.time() + ELECTION_COLLECT_TIMEOUT
+            while time.time() < deadline:
+                try:
+                    data, _ = s.recvfrom(4096)
+                    resp = json.loads(data.decode())
+                    if (resp.get("TASK") == "ELECTION_RESPONSE"
+                            and resp.get("WORKER_UUID") != WORKER_UUID):
+                        candidates.append(resp)
+                        print(f"[ELECTION] Candidato: {resp['WORKER_UUID']} "
+                              f"({resp.get('FREE_SPACE', 0) // (1024**3)} GB livre)")
+                except socket.timeout:
+                    break
+                except Exception:
+                    pass
+    except Exception as exc:
+        print(f"[ELECTION] Erro no socket de eleição: {exc}")
+
+    # Se chegou NEW_MASTER durante a coleta, cancela
+    if new_master_event.is_set():
+        print("[ELECTION] NEW_MASTER recebido durante coleta. Eleição cancelada.")
+        with state_lock:
+            election_in_progress = False
+        return
+
     candidates.sort(key=_election_key)
     winner = candidates[0]
 
@@ -448,19 +489,22 @@ def _become_master():
 
 
 def _notify_new_master():
-    """Notifica todos os peers (TCP + UDP broadcast) sobre o novo master."""
+    """Notifica a rede via UDP broadcast sobre o novo master."""
     payload = {
-        "TASK":             "NEW_MASTER",
-        "MASTER_HOST":      WORKER_HOST,
-        "MASTER_PORT":      WORKER_PORT,
-        "MASTER_UUID":      WORKER_UUID,
+        "TASK":              "NEW_MASTER",
+        "MASTER_HOST":       WORKER_HOST,
+        "MASTER_PORT":       WORKER_PORT,
+        "MASTER_UUID":       WORKER_UUID,
         "MASTER_FREE_SPACE": get_free_space(),
     }
-    for h, p in get_peers():
-        print(f"[ELECTION] Notificando {h}:{p}")
-        send_tcp(h, p, payload, timeout=3)
-    send_udp(payload)   # backup / alcança nós que não estão em WORKER_PEERS
-    print("[ELECTION] Notificação de novo master concluída.")
+    # [LEGADO] Notificação TCP unicast por peers conhecidos (desativado)
+    # for h, p in get_peers():
+    #     print(f"[ELECTION] Notificando {h}:{p}")
+    #     send_tcp(h, p, payload, timeout=3)
+
+    # Broadcast alcança todos os workers sem conhecimento prévio
+    send_udp(payload)
+    print("[ELECTION] NEW_MASTER enviado via broadcast.")
 
 
 def _accept_new_master(host, port, uuid, free_space=0):
@@ -582,7 +626,21 @@ def _start_udp_listener():
 
         task = payload.get("TASK")
 
-        if task == "DISCOVER_WORKER":
+        if task == "ELECTION_BROADCAST":
+            # Worker responde com seus dados para o candidato calcular o vencedor
+            sender_uuid = payload.get("WORKER_UUID")
+            if sender_uuid == WORKER_UUID:
+                continue  # ignora eco local
+            print(f"[ELECTION] ELECTION_BROADCAST de {addr} (UUID={sender_uuid})")
+            sock.sendto(json.dumps({
+                "TASK":        "ELECTION_RESPONSE",
+                "WORKER_UUID": WORKER_UUID,
+                "WORKER_HOST": WORKER_HOST,
+                "WORKER_PORT": WORKER_PORT,
+                "FREE_SPACE":  get_free_space(),
+            }).encode(), addr)
+
+        elif task == "DISCOVER_WORKER":
             if payload.get("WORKER_UUID") == WORKER_UUID:
                 continue
             sock.sendto(json.dumps({
@@ -646,16 +704,16 @@ def enviar_heartbeat():
                 with state_lock:
                     failed_hb = 0
                     election_in_progress = False
-                # Atualiza a lista de peers com os dados do master
-                peers_from_master = resp.get("PEERS", [])
-                if peers_from_master:
-                    _update_known_peers(peers_from_master)
+                # [LEGADO] Peers vinham do master — desativado (workers não conhecem peers)
+                # peers_from_master = resp.get("PEERS", [])
+                # if peers_from_master:
+                #     _update_known_peers(peers_from_master)
 
             elif r == "NOT_MASTER":
-                print("[HEARTBEAT] Nó respondeu NOT_MASTER → eleição.")
+                print("[HEARTBEAT] Nó respondeu NOT_MASTER → iniciando eleição.")
                 with state_lock:
                     failed_hb = HEARTBEAT_THRESHOLD
-                threading.Thread(target=start_election, daemon=True).start()
+                threading.Thread(target=_trigger_election_with_delay, daemon=True).start()
 
     except (ConnectionRefusedError, socket.timeout, ConnectionError, OSError) as exc:
         with state_lock:
@@ -664,7 +722,7 @@ def enviar_heartbeat():
         print(f"[HEARTBEAT] Falha {count}/{HEARTBEAT_THRESHOLD} "
               f"com {master_ip}:{master_port} — {exc}")
         if count >= HEARTBEAT_THRESHOLD:
-            threading.Thread(target=start_election, daemon=True).start()
+            threading.Thread(target=_trigger_election_with_delay, daemon=True).start()
 
     except Exception as exc:
         print(f"[HEARTBEAT] Erro inesperado: {exc}")
