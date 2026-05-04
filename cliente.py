@@ -46,7 +46,7 @@ WORKER_PORT      = int(os.environ["WORKER_PORT"])
 WORKER_PEERS_STR = os.getenv("WORKER_PEERS", "")
 
 WORKER_DISCOVERY_ENABLED  = os.getenv("WORKER_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes")
-WORKER_BROADCAST_ADDRESS  = os.getenv("WORKER_BROADCAST_ADDRESS", "255.255.255.255")
+_BROADCAST_ENV            = os.getenv("WORKER_BROADCAST_ADDRESS", "")
 WORKER_DISCOVERY_TIMEOUT  = int(os.getenv("WORKER_DISCOVERY_TIMEOUT", "2"))
 HEARTBEAT_THRESHOLD       = int(os.getenv("HEARTBEAT_THRESHOLD", "4"))
 HEARTBEAT_INTERVAL        = int(os.getenv("HEARTBEAT_INTERVAL", "5"))
@@ -98,8 +98,23 @@ def _detect_host() -> str:
     return "127.0.0.1"
 
 
-STATIC_PEERS = _parse_peers(WORKER_PEERS_STR)
-WORKER_HOST  = _detect_host()
+def _detect_broadcast(local_ip: str) -> str:
+    """
+    Deriva o endereço de broadcast direcionado a partir do IP local.
+    Assume subrede /24 (mais comum em LANs e redes universitárias).
+    Ex: 10.62.206.23 → 10.62.206.255
+    Se o usuário definiu WORKER_BROADCAST_ADDRESS explicitamente
+    (e não é o genérico 255.255.255.255), usa o valor dele.
+    """
+    if _BROADCAST_ENV and _BROADCAST_ENV != "255.255.255.255":
+        return _BROADCAST_ENV
+    prefix = ".".join(local_ip.split(".")[:3])
+    return f"{prefix}.255"
+
+
+STATIC_PEERS           = _parse_peers(WORKER_PEERS_STR)
+WORKER_HOST            = _detect_host()
+WORKER_BROADCAST_ADDRESS = _detect_broadcast(WORKER_HOST)
 
 print("=" * 60)
 print(f"  Worker iniciando")
@@ -107,7 +122,7 @@ print(f"  UUID : {WORKER_UUID}")
 print(f"  Host : {WORKER_HOST}:{WORKER_PORT}")
 print(f"  Peers estáticos: {STATIC_PEERS or '(nenhum)'}")
 print(f"  Master UUID alvo: {ORIGINAL_SERVER_UUID or '(qualquer)'}")
-print(f"  Descoberta via broadcast na porta UDP {DISCOVERY_PORT}")
+print(f"  Broadcast (descoberta): {WORKER_BROADCAST_ADDRESS}:{DISCOVERY_PORT}")
 print("=" * 60)
 
 if not STATIC_PEERS:

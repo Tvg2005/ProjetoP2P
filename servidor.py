@@ -18,8 +18,7 @@ PORT        = int(os.environ["MASTER_PORT"])
 SERVER_UUID = os.environ["SERVER_UUID"]
 
 # Porta UDP para descoberta do master por broadcast (SERVER_UUID)
-DISCOVERY_PORT           = int(os.getenv("DISCOVERY_PORT", str(PORT + 1)))
-BROADCAST_RESPONSE_ADDR  = os.getenv("WORKER_BROADCAST_ADDRESS", "255.255.255.255")
+DISCOVERY_PORT = int(os.getenv("DISCOVERY_PORT", str(PORT + 1)))
 
 WORKER_STALE_TIMEOUT = int(os.getenv("WORKER_STALE_TIMEOUT", "30"))
 
@@ -44,8 +43,26 @@ def _detect_local_ip() -> str:
     return "127.0.0.1"
 
 
-SERVER_HOST = _detect_local_ip()
+def _detect_broadcast(local_ip: str) -> str:
+    """
+    Deriva o endereço de broadcast direcionado a partir do IP local.
+    Assume subrede /24 (mais comum em redes locais).
+    Ex: 10.62.206.23 → 10.62.206.255
+    Redes /24 cobrem a grande maioria dos ambientes LAN/universitários.
+    """
+    env_val = os.getenv("WORKER_BROADCAST_ADDRESS", "")
+    # Se o usuário definiu explicitamente e não é o genérico, usa o dele
+    if env_val and env_val != "255.255.255.255":
+        return env_val
+    # Auto-detecta o broadcast direcionado da subrede /24
+    prefix = ".".join(local_ip.split(".")[:3])
+    return f"{prefix}.255"
+
+
+SERVER_HOST      = _detect_local_ip()
+BROADCAST_ADDR   = _detect_broadcast(SERVER_HOST)
 print(f"[MASTER] IP detectado automaticamente: {SERVER_HOST}")
+print(f"[MASTER] Broadcast de descoberta: {BROADCAST_ADDR}")
 
 # ── Registro de workers ───────────────────────────────────────────────────────
 # { worker_uuid: {uuid, host, port, last_seen} }
