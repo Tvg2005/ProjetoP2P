@@ -3,9 +3,11 @@ Worker P2P — Eleição de master via Bully Algorithm (TCP puro)
 
 CONFIGURAÇÃO OBRIGATÓRIA em cada máquina (.env):
   SERVER_UUID=<uuid-do-master>   ← mesmo valor usado no servidor
-  WORKER_UUID=<uuid-deste-worker>
   MASTER_PORT=<porta-tcp-do-master>
   WORKER_PORT=<porta-tcp-deste-worker>
+
+  WORKER_UUID é OPCIONAL: se não definido (ou vazio), um UUID único é gerado
+  automaticamente e salvo em .worker_id para persistência entre reinicializações.
 
   O IP do master é descoberto AUTOMATICAMENTE via broadcast UDP.
   Não é necessário configurar MASTER_IP.
@@ -14,9 +16,9 @@ CONFIGURAÇÃO OBRIGATÓRIA em cada máquina (.env):
 
 COMO FUNCIONA A ELEIÇÃO:
   1. Um nó detecta que o master caiu (N heartbeats falhos).
-  2. Ele consulta o WORKER_STATUS de todos os peers via TCP.
+  2. Envia ELECTION_BROADCAST na subrede e coleta respostas dos peers.
   3. Todos os nós aplicam a mesma ordem: (-free_space, uuid) → mesmo vencedor.
-  4. O vencedor vira master e notifica via TCP + UDP broadcast.
+  4. O vencedor vira master e notifica via UDP broadcast.
   5. Os demais atualizam o ponteiro para o novo master.
 """
 
@@ -27,6 +29,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid as _uuid_mod
 
 import schedule
 from dotenv import load_dotenv
@@ -35,12 +38,11 @@ load_dotenv()
 
 # ── Variáveis de ambiente ─────────────────────────────────────────────────────
 
-for _var in ["MASTER_PORT", "SERVER_UUID", "WORKER_UUID", "WORKER_PORT"]:
+for _var in ["MASTER_PORT", "SERVER_UUID", "WORKER_PORT"]:
     if _var not in os.environ:
         raise EnvironmentError(f"Variável ausente no .env: {_var}")
 
 MASTER_PORT      = int(os.environ["MASTER_PORT"])
-WORKER_UUID      = os.environ["WORKER_UUID"]
 _WH_ENV          = os.getenv("WORKER_HOST", "")
 WORKER_PORT      = int(os.environ["WORKER_PORT"])
 # [LEGADO] WORKER_PEERS_STR — peers estáticos; eleição agora usa broadcast
@@ -64,6 +66,46 @@ DISCOVERY_PORT = int(os.getenv("DISCOVERY_PORT", str(MASTER_PORT + 1)))
 # Eleição via broadcast — tempos configuráveis
 ELECTION_DELAY           = int(os.getenv("ELECTION_DELAY", "30"))   # espera antes de eleger
 ELECTION_COLLECT_TIMEOUT = int(os.getenv("ELECTION_COLLECT_TIMEOUT", "5"))  # janela de coleta
+
+
+# ── UUID do worker ────────────────────────────────────────────────────────────
+
+_WORKER_ID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker_id")
+
+
+def _resolve_worker_uuid() -> str:
+    """
+    Resolve o UUID do worker com a seguinte prioridade:
+      1. Variável WORKER_UUID definida no .env (override manual)
+      2. Arquivo .worker_id persistido de uma execução anterior
+      3. Gera um novo UUID aleatório e salva em .worker_id
+    """
+    # 1. Override manual via .env
+    env_val = os.getenv("WORKER_UUID", "").strip()
+    if env_val:
+        return env_val
+
+    # 2. UUID persistido de execução anterior
+    if os.path.exists(_WORKER_ID_FILE):
+        try:
+            saved = open(_WORKER_ID_FILE).read().strip()
+            if saved:
+                return saved
+        except Exception:
+            pass
+
+    # 3. Gera e persiste um novo UUID curto
+    short = _uuid_mod.uuid4().hex[:8].upper()
+    new_id = f"WRK-{short}"
+    try:
+        with open(_WORKER_ID_FILE, "w") as f:
+            f.write(new_id)
+    except Exception:
+        pass  # sem persistência se não conseguir escrever
+    return new_id
+
+
+WORKER_UUID = _resolve_worker_uuid()
 
 
 # ── Helpers de inicialização ──────────────────────────────────────────────────
