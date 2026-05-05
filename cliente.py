@@ -448,7 +448,7 @@ def start_election_broadcast():
         received = new_master_event.wait(timeout=NEW_MASTER_WAIT)
         if not received:
             print("[ELECTION] Vencedor não anunciou. Reiniciando eleição…")
-            threading.Thread(target=start_election, daemon=True).start()
+            threading.Thread(target=start_election_broadcast, daemon=True).start()
 
 
 # ── Ações de quem vira master ─────────────────────────────────────────────────
@@ -659,13 +659,36 @@ def _start_udp_listener():
             )
 
 
+# ── Eleição com delay ────────────────────────────────────────────────────────
+
+def _trigger_election_with_delay():
+    """
+    Aguarda ELECTION_DELAY segundos antes de iniciar a eleição via broadcast.
+    Permite que um novo master já eleito anuncie-se antes de outro iniciar a eleição.
+    Cancela se new_master_event for sinalizado durante a espera.
+    """
+    global election_in_progress
+    print(f"[HEARTBEAT] Aguardando {ELECTION_DELAY}s antes de iniciar eleição…")
+    cancelled = new_master_event.wait(timeout=ELECTION_DELAY)
+    if cancelled:
+        print("[HEARTBEAT] Novo master anunciado durante espera — eleição cancelada.")
+        with state_lock:
+            election_in_progress = False
+        return
+    # Reseta o flag para que start_election_broadcast possa prosseguir
+    # (ele mesmo o re-seta para True internamente)
+    with state_lock:
+        election_in_progress = False
+    start_election_broadcast()
+
+
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
 
 def enviar_heartbeat():
-    global failed_hb
+    global failed_hb, election_in_progress
 
     with state_lock:
-        if is_master:
+        if is_master or election_in_progress:
             return
         master_ip   = current_master["ip"]
         master_port = current_master["port"]
@@ -712,16 +735,23 @@ def enviar_heartbeat():
             elif r == "NOT_MASTER":
                 print("[HEARTBEAT] Nó respondeu NOT_MASTER → iniciando eleição.")
                 with state_lock:
+                    already   = election_in_progress
                     failed_hb = HEARTBEAT_THRESHOLD
-                threading.Thread(target=_trigger_election_with_delay, daemon=True).start()
+                if not already:
+                    with state_lock:
+                        election_in_progress = True
+                    threading.Thread(target=_trigger_election_with_delay, daemon=True).start()
 
     except (ConnectionRefusedError, socket.timeout, ConnectionError, OSError) as exc:
         with state_lock:
             failed_hb += 1
-            count = failed_hb
+            count     = failed_hb
+            already   = election_in_progress
         print(f"[HEARTBEAT] Falha {count}/{HEARTBEAT_THRESHOLD} "
               f"com {master_ip}:{master_port} — {exc}")
-        if count >= HEARTBEAT_THRESHOLD:
+        if count >= HEARTBEAT_THRESHOLD and not already:
+            with state_lock:
+                election_in_progress = True   # reserva antes de lançar a thread
             threading.Thread(target=_trigger_election_with_delay, daemon=True).start()
 
     except Exception as exc:
@@ -744,8 +774,8 @@ def pedir_tarefa():
     import random
 
     with state_lock:
-        if is_master:
-            return   # master não pede tarefas
+        if is_master or election_in_progress:
+            return   # master não pede tarefas / eleição em andamento
         master_ip   = current_master["ip"]
         master_port = current_master["port"]
         master_uuid = current_master.get("uuid", "")
