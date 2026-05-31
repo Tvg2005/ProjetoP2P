@@ -259,6 +259,59 @@ Worker                              Master
 
 ---
 
+## Sprint 3 — Negociação entre Masters e Redirecionamento de Workers
+
+A última fase implementada adiciona suporte a **masters colaborativos** e **workers temporariamente emprestados**.
+
+### 10. Quando o master fica sobrecarregado
+
+O master monitora sua carga de tarefas e, quando ultrapassa a capacidade configurada, pode solicitar ajuda a seus vizinhos definidos em `MASTER_NEIGHBORS`.
+
+- `MASTER_CAPACITY` define quantas tarefas o master pode suportar antes de pedir ajuda.
+- Quando saturado, ele envia `request_help` a outros masters.
+- Se um vizinho aceitar, ele devolve `response_accepted` com workers disponíveis.
+
+### 11. Redirecionamento de workers
+
+Quando um master vizinho concorda em emprestar um worker, ele envia um comando `command_redirect` diretamente ao worker.
+
+O worker então:
+- reconecta ao novo master
+- registra-se como `register_temporary_worker`
+- continua pedindo tarefas ao master temporário
+
+### 12. Retorno do worker ao master original
+
+Quando a carga normaliza no master que recebeu o worker, ele envia `command_release` para o worker, que:
+- encerra o vínculo com o master temporário
+- retorna ao master original
+- recomeça o ciclo de requisição de tarefas com o master original
+
+Além disso, o master original é notificado com `notify_worker_returned` para atualizar seu registro de workers.
+
+### 13. Principais novos campos e comandos
+
+- `request_help` → solicitação de ajuda entre masters
+- `response_accepted` / `response_rejected` → resposta ao pedido de ajuda
+- `command_redirect` → instrui um worker a trocar de master
+- `register_temporary_worker` → worker informa ao novo master que está emprestado
+- `command_release` → libera worker de volta ao master original
+- `notify_worker_returned` → master temporário informa o master de origem sobre o retorno
+
+### 14. Configuração adicional
+
+As variáveis de ambiente novas ou ampliadas para Sprint 3 incluem:
+
+- `MASTER_NEIGHBORS` — lista de peers do master no formato `MASTER_ID:IP:PORT,...`
+- `MASTER_CAPACITY` — limite de tarefas antes de pedir ajuda
+- `MASTER_RELEASE_THRESHOLD` — carga mínima para liberar workers emprestados
+- `MASTER_HELP_TIMEOUT` — timeout para comunicação entre masters
+- `LOAD_MONITOR_INTERVAL` — intervalo de verificação de carga
+
+> Essa extensão permite que a rede de masters funcione de forma mais equilibrada, reduzindo sobrecarga e evitando que um único nó fique saturado.
+
+---
+
 ## Configuração (`.env`)
 
 Cada máquina precisa de um `.env` com sua identidade. O IP do master é o único dado que precisa ser configurado manualmente.
@@ -279,6 +332,13 @@ HEARTBEAT_INTERVAL=5        # segundos entre cada heartbeat
 
 # Controle de tarefas (Sprint 2)
 TASK_INTERVAL=10            # segundos entre cada solicitação de tarefa
+
+# Novas configurações de Sprint 3
+MASTER_NEIGHBORS=SRV-NEIGHBOR:192.168.1.101:8000,SRV-NEIGHBOR2:192.168.1.102:8000
+MASTER_CAPACITY=100         # limite de tarefas antes de pedir ajuda
+MASTER_RELEASE_THRESHOLD=60 # carga mínima para liberar workers emprestados
+MASTER_HELP_TIMEOUT=5       # timeout para comunicação entre masters
+LOAD_MONITOR_INTERVAL=5     # intervalo em segundos para verificação de carga
 ```
 
 > `WORKER_PEERS` pode ficar **vazio** — os peers são descobertos automaticamente via master.

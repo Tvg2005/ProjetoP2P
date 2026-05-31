@@ -22,6 +22,11 @@ Cada máquina (master e workers) precisa de um arquivo `.env` na raiz do projeto
 | `DISCOVERY_PORT` | ❌ | `MASTER_PORT + 1` | Porta UDP onde o servidor escuta `FIND_MASTER` broadcasts. Deve ser a mesma em servidor e clientes. |
 | `WORKER_HOST` | ❌ | *auto-detectado* | IP local deste worker. Se omitido, detectado automaticamente via socket UDP conectado a `8.8.8.8`. |
 | `WORKER_BROADCAST_ADDRESS` | ❌ | *auto-detectado* | Endereço de broadcast para discovery e eleição. Se omitido ou `255.255.255.255`, usa o broadcast direcionado `/24` da rede local (ex: `10.62.206.255`). |
+| `MASTER_NEIGHBORS` | ❌ | `""` | Lista de masters vizinhos no formato `id:ip:porta` separados por vírgula. Usado pelo master para enviar `request_help` e negociar empréstimos. |
+| `MASTER_CAPACITY` | ❌ | `100` | Capacidade de carga do master em número de tarefas pendentes. Quando `current_load > MASTER_CAPACITY`, o master tenta pedir ajuda. |
+| `MASTER_RELEASE_THRESHOLD` | ❌ | `60` | Limite abaixo do qual um master libera workers emprestados de volta ao mestre original. Deve ser menor que `MASTER_CAPACITY` para evitar ping-pong. |
+| `MASTER_HELP_TIMEOUT` | ❌ | `5` | Timeout em segundos para aguardar resposta a `request_help` de um master vizinho. |
+| `LOAD_MONITOR_INTERVAL` | ❌ | `5` | Intervalo em segundos para o master verificar carga e disparar `request_help` ou `command_release`. |
 
 ---
 

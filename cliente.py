@@ -243,6 +243,11 @@ current_master = {
     "port": MASTER_PORT,
 }
 
+redirect_target = None
+return_target = None
+borrowed_original_master_address = None
+task_in_progress = False
+
 # [LEGADO] known_peers — workers não conhecem peers; eleição agora via broadcast
 # Mantido para compatibilidade com código legado comentado abaixo.
 known_peers      = []   # workers não conhecem peers antes do master cair
@@ -279,15 +284,76 @@ def send_tcp(host: str, port: int, payload: dict, timeout: int = 3):
     return msgs
 
 
-def send_udp(payload: dict):
-    """Envia payload JSON via UDP broadcast (melhor esforço)."""
+def _parse_address(address: str) -> tuple[str, int]:
+    if not isinstance(address, str) or ":" not in address:
+        raise ValueError("Endereço inválido. Deve ser ip:porta")
+    host, port = address.rsplit(":", 1)
+    return host, int(port)
+
+
+def _connect_to_master(address: str, register_temporary: bool = False,
+                       original_master_address: str | None = None):
+    global borrowed_original_master_address
+    host, port = _parse_address(address)
+    with state_lock:
+        current_master["ip"] = host
+        current_master["port"] = port
+        if register_temporary:
+            current_master["uuid"] = f"BORROWED:{host}:{port}"
+    print(f"[WORKER] Conectando ao master {host}:{port}")
+
+    if register_temporary:
+        if not original_master_address:
+            original_master_address = _format_address(current_master["ip"], current_master["port"])
+        payload = {
+            "type": "register_temporary_worker",
+            "request_id": _uuid_mod.uuid4().hex,
+            "payload": {
+                "worker_id": WORKER_UUID,
+                "original_master_address": original_master_address,
+                "worker_host": WORKER_HOST,
+                "worker_port": WORKER_PORT,
+            },
+        }
+        send_tcp(host, port, payload, timeout=10)
+
+
+def _format_address(host: str, port: int) -> str:
+    return f"{host}:{port}"
+
+
+def _attempt_redirect():
+    global redirect_target, return_target, borrowed_original_master_address
+    with state_lock:
+        if task_in_progress:
+            return
+        if return_target:
+            target = return_target
+            is_return = True
+        elif redirect_target:
+            target = redirect_target
+            is_return = False
+        else:
+            return
+
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(json.dumps(payload).encode(),
-                     (WORKER_BROADCAST_ADDRESS, WORKER_PORT))
-    except Exception:
-        pass
+        if is_return:
+            print(f"[WORKER] Executando return para {target}")
+            _connect_to_master(target)
+            with state_lock:
+                current_master["uuid"] = ORIGINAL_SERVER_UUID
+                return_target = None
+                borrowed_original_master_address = None
+        else:
+            with state_lock:
+                if borrowed_original_master_address is None:
+                    borrowed_original_master_address = _format_address(current_master["ip"], current_master["port"])
+                redirect_target = None
+            print(f"[WORKER] Executando redirect para {target}")
+            _connect_to_master(target, register_temporary=True,
+                               original_master_address=borrowed_original_master_address)
+    except Exception as exc:
+        print(f"[WORKER] Falha no redirecionamento: {exc}")
 
 
 def get_free_space() -> int:
@@ -579,6 +645,7 @@ def _accept_new_master(host, port, uuid, free_space=0):
 # ── Servidor TCP de status ────────────────────────────────────────────────────
 
 def _handle_conn(conn, addr):
+    global redirect_target, return_target
     buf = ""
     try:
         while True:
@@ -625,6 +692,25 @@ def _handle_conn(conn, addr):
                     }) + "\n").encode())
 
                 else:
+                    command_type = payload.get("type", "").lower()
+                    if command_type == "command_redirect":
+                        address = payload.get("payload", {}).get("new_master_address")
+                        if address:
+                            with state_lock:
+                                redirect_target = address
+                            print(f"[WORKER] command_redirect recebido → {address}")
+                            threading.Thread(target=_attempt_redirect, daemon=True).start()
+                        continue
+
+                    if command_type == "command_release":
+                        address = payload.get("payload", {}).get("original_master_address")
+                        if address:
+                            with state_lock:
+                                return_target = address
+                            print(f"[WORKER] command_release recebido → {address}")
+                            threading.Thread(target=_attempt_redirect, daemon=True).start()
+                        continue
+
                     conn.sendall((json.dumps({
                         "TASK": "ERROR", "RESPONSE": "UNKNOWN_TASK",
                     }) + "\n").encode())
@@ -806,6 +892,7 @@ def enviar_heartbeat():
 # ── Ciclo de tarefas (Sprint 2) ──────────────────────────────────────────────
 
 def pedir_tarefa():
+    global task_in_progress
     """
     Ciclo completo de tarefa conforme Sprint 2:
       1. Worker se apresenta ao master (Payload 2.1 ou 2.1b se emprestado)
@@ -818,6 +905,10 @@ def pedir_tarefa():
     with state_lock:
         if is_master or election_in_progress:
             return   # master não pede tarefas / eleição em andamento
+        if redirect_target or return_target:
+            if not task_in_progress:
+                threading.Thread(target=_attempt_redirect, daemon=True).start()
+            return
         master_ip   = current_master["ip"]
         master_port = current_master["port"]
         master_uuid = current_master.get("uuid", "")
@@ -875,40 +966,48 @@ def pedir_tarefa():
                 task_id = resp.get("TASK_ID", "?")
                 print(f"[TAREFA] Recebida | ID={task_id} | USER={user} | Processando...")
 
-                # Passo 3: simula processamento (1–4 segundos)
-                sleep_time = random.uniform(1, 4)
-                time.sleep(sleep_time)
+                with state_lock:
+                    task_in_progress = True
 
-                # Determina resultado (90% OK, 10% NOK)
-                status = "OK" if random.random() < 0.9 else "NOK"
-
-                # Payload 2.4 — reporta resultado
-                result_payload = {
-                    "STATUS":      status,
-                    "TASK":        "QUERY",
-                    "WORKER_UUID": WORKER_UUID,
-                }
-                # Inclui SERVER_UUID se emprestado
-                if ORIGINAL_SERVER_UUID and master_uuid != ORIGINAL_SERVER_UUID:
-                    result_payload["SERVER_UUID"] = ORIGINAL_SERVER_UUID
-
-                sock.sendall((json.dumps(result_payload) + "\n").encode())
-                print(f"[TAREFA] Resultado enviado: {status} (processado em {sleep_time:.1f}s)")
-
-                # Passo 4: aguarda ACK (Payload 2.5)
                 try:
-                    ack_data = sock.recv(4096).decode()
-                    buf += ack_data
-                    while "\n" in buf:
-                        ack_line, buf = buf.split("\n", 1)
-                        try:
-                            ack = json.loads(ack_line)
-                            if ack.get("STATUS") == "ACK":
-                                print(f"[TAREFA] ACK recebido. Tarefa {task_id} concluída.")
-                        except Exception:
-                            pass
-                except socket.timeout:
-                    print("[TAREFA] Timeout aguardando ACK.")
+                    # Passo 3: simula processamento (1–4 segundos)
+                    sleep_time = random.uniform(1, 4)
+                    time.sleep(sleep_time)
+
+                    # Determina resultado (90% OK, 10% NOK)
+                    status = "OK" if random.random() < 0.9 else "NOK"
+
+                    # Payload 2.4 — reporta resultado
+                    result_payload = {
+                        "STATUS":      status,
+                        "TASK":        "QUERY",
+                        "WORKER_UUID": WORKER_UUID,
+                    }
+                    # Inclui SERVER_UUID se emprestado
+                    if ORIGINAL_SERVER_UUID and master_uuid != ORIGINAL_SERVER_UUID:
+                        result_payload["SERVER_UUID"] = ORIGINAL_SERVER_UUID
+
+                    sock.sendall((json.dumps(result_payload) + "\n").encode())
+                    print(f"[TAREFA] Resultado enviado: {status} (processado em {sleep_time:.1f}s)")
+
+                    # Passo 4: aguarda ACK (Payload 2.5)
+                    try:
+                        ack_data = sock.recv(4096).decode()
+                        buf += ack_data
+                        while "\n" in buf:
+                            ack_line, buf = buf.split("\n", 1)
+                            try:
+                                ack = json.loads(ack_line)
+                                if ack.get("STATUS") == "ACK":
+                                    print(f"[TAREFA] ACK recebido. Tarefa {task_id} concluída.")
+                            except Exception:
+                                pass
+                    except socket.timeout:
+                        print("[TAREFA] Timeout aguardando ACK.")
+                finally:
+                    with state_lock:
+                        task_in_progress = False
+                    _attempt_redirect()
                 break
 
     except (ConnectionRefusedError, socket.timeout, OSError) as exc:

@@ -4,6 +4,7 @@ import queue
 import socket
 import threading
 import time
+import uuid
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -21,6 +22,11 @@ SERVER_UUID = os.environ["SERVER_UUID"]
 DISCOVERY_PORT = int(os.getenv("DISCOVERY_PORT", str(PORT + 1)))
 
 WORKER_STALE_TIMEOUT = int(os.getenv("WORKER_STALE_TIMEOUT", "30"))
+MASTER_NEIGHBORS_RAW = os.getenv("MASTER_NEIGHBORS", "")
+MASTER_CAPACITY = int(os.getenv("MASTER_CAPACITY", "100"))
+MASTER_RELEASE_THRESHOLD = int(os.getenv("MASTER_RELEASE_THRESHOLD", "60"))
+MASTER_HELP_TIMEOUT = int(os.getenv("MASTER_HELP_TIMEOUT", "5"))
+LOAD_MONITOR_INTERVAL = int(os.getenv("LOAD_MONITOR_INTERVAL", "5"))
 
 
 def _detect_local_ip() -> str:
@@ -59,25 +65,97 @@ def _detect_broadcast(local_ip: str) -> str:
     return f"{prefix}.255"
 
 
+def _parse_neighbors(raw: str) -> list[dict]:
+    out = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) != 3:
+            print(f"[MASTER] Neighbor inválido ignorado: {item}")
+            continue
+        master_id, host, port = parts
+        try:
+            out.append({
+                "master_id": master_id,
+                "host":      host,
+                "port":      int(port),
+            })
+        except ValueError:
+            print(f"[MASTER] Neighbor inválido ignorado: {item}")
+    return out
+
+
+def _format_address(host: str, port: int) -> str:
+    return f"{host}:{port}"
+
+
+def _parse_address(address: str) -> tuple[str, int]:
+    if not isinstance(address, str) or ":" not in address:
+        raise ValueError("Address must be in ip:port format")
+    host, port = address.rsplit(":", 1)
+    return host, int(port)
+
+
+def _send_tcp(host: str, port: int, payload: dict, timeout: float = 5.0) -> list[dict]:
+    msgs = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((host, port))
+            s.sendall((json.dumps(payload) + "\n").encode())
+            buf = ""
+            while True:
+                try:
+                    chunk = s.recv(4096).decode()
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    try:
+                        msgs.append(json.loads(line))
+                    except Exception:
+                        pass
+    except Exception as exc:
+        print(f"[MASTER] Erro TCP para {host}:{port} — {exc}")
+    return msgs
+
+
 SERVER_HOST      = _detect_local_ip()
 BROADCAST_ADDR   = _detect_broadcast(SERVER_HOST)
 print(f"[MASTER] IP detectado automaticamente: {SERVER_HOST}")
 print(f"[MASTER] Broadcast de descoberta: {BROADCAST_ADDR}")
+MASTER_NEIGHBORS = _parse_neighbors(MASTER_NEIGHBORS_RAW)
+help_lock = threading.Lock()
 
 # ── Registro de workers ───────────────────────────────────────────────────────
-# { worker_uuid: {uuid, host, port, last_seen} }
+# { worker_uuid: {uuid, host, port, last_seen, busy, borrowed, origin_master_id, original_master_address, borrowed_to}} 
 
 registry      = {}
 registry_lock = threading.Lock()
 
 
-def _register_worker(uuid, host, port):
+def _register_worker(uuid, host, port, borrowed=None,
+                     origin_master_id=None,
+                     original_master_address=None,
+                     borrowed_to=None):
     with registry_lock:
+        previous = registry.get(uuid, {})
         registry[uuid] = {
-            "uuid":      uuid,
-            "host":      host,
-            "port":      int(port),
-            "last_seen": time.time(),
+            "uuid":                    uuid,
+            "host":                    host,
+            "port":                    int(port),
+            "last_seen":               time.time(),
+            "busy":                    previous.get("busy", False),
+            "borrowed":                borrowed if borrowed is not None else previous.get("borrowed", False),
+            "origin_master_id":        origin_master_id if origin_master_id is not None else previous.get("origin_master_id"),
+            "original_master_address": original_master_address if original_master_address is not None else previous.get("original_master_address"),
+            "borrowed_to":             borrowed_to if borrowed_to is not None else previous.get("borrowed_to"),
+            "pending_return":          previous.get("pending_return", False),
         }
 
 
@@ -94,12 +172,280 @@ def _get_active_peers(exclude_uuid=None):
         return [
             {"uuid": w["uuid"], "host": w["host"], "port": w["port"]}
             for u, w in registry.items()
-            if u != exclude_uuid
+            if u != exclude_uuid and not w.get("borrowed", False)
         ]
 
 
-# ── Fila de Tarefas ───────────────────────────────────────────────────────────
-# Cada tarefa é um dict: {"id": str, "USER": str}
+def _get_idle_workers():
+    """Retorna workers locais disponíveis para ceder ou para tarefa."""
+    now = time.time()
+    with registry_lock:
+        stale = [u for u, w in registry.items()
+                 if now - w["last_seen"] > WORKER_STALE_TIMEOUT]
+        for u in stale:
+            print(f"[MASTER] Worker {u} removido do registro (inativo).")
+            del registry[u]
+
+        return [
+            w for w in registry.values()
+            if not w.get("busy", False)
+            and not w.get("borrowed", False)
+            and not w.get("pending_return", False)
+        ]
+
+
+def _get_borrowed_workers():
+    with registry_lock:
+        return [
+            w for w in registry.values()
+            if w.get("borrowed", False)
+        ]
+
+
+def _mark_worker_busy(worker_uuid, busy=True):
+    with registry_lock:
+        if worker_uuid in registry:
+            registry[worker_uuid]["busy"] = busy
+
+
+def _mark_worker_borrowed(worker_uuid, borrowed=True, borrowed_to=None,
+                          original_master_address=None, pending_return=False):
+    with registry_lock:
+        if worker_uuid in registry:
+            registry[worker_uuid]["borrowed"] = borrowed
+            if borrowed_to is not None:
+                registry[worker_uuid]["borrowed_to"] = borrowed_to
+            if original_master_address is not None:
+                registry[worker_uuid]["original_master_address"] = original_master_address
+            registry[worker_uuid]["pending_return"] = pending_return
+
+
+def _register_temporary_worker(worker_uuid, host, port, original_master_address):
+    _register_worker(
+        worker_uuid,
+        host,
+        port,
+        borrowed=True,
+        origin_master_id=None,
+        original_master_address=original_master_address,
+    )
+
+
+def _find_neighbor_address(master_id: str) -> str | None:
+    for neighbor in MASTER_NEIGHBORS:
+        if neighbor["master_id"] == master_id:
+            return _format_address(neighbor["host"], neighbor["port"])
+    return None
+
+
+def _current_load() -> int:
+    return task_queue.qsize()
+
+
+def _send_command_redirect(worker, target_address, request_id=None):
+    if not target_address:
+        raise ValueError("target_address is required for command_redirect")
+    request_id = request_id or str(uuid.uuid4())
+    payload = {
+        "type": "command_redirect",
+        "request_id": request_id,
+        "payload": {
+            "new_master_address": target_address,
+        },
+    }
+    print(f"[MASTER] Enviando command_redirect para {worker['uuid']} "
+          f"({worker['host']}:{worker['port']}) → {target_address}")
+    _send_tcp(worker["host"], worker["port"], payload, timeout=MASTER_HELP_TIMEOUT)
+
+
+def _handle_notify_worker_returned(msg):
+    payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
+    worker_id = payload.get("worker_id")
+    if not worker_id:
+        return
+    with registry_lock:
+        worker = registry.get(worker_id)
+        if worker:
+            print(f"[MASTER] Notify_worker_returned recebido para {worker_id}")
+            worker["borrowed"] = False
+            worker["borrowed_to"] = None
+            worker["original_master_address"] = None
+            worker["pending_return"] = False
+
+
+def _handle_request_help(msg):
+    request_id = msg.get("request_id")
+    payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
+    if not request_id or not isinstance(payload, dict):
+        return {
+            "type": "response_rejected",
+            "request_id": request_id or str(uuid.uuid4()),
+            "payload": {"reason": "invalid_request"},
+        }
+
+    current_load = _current_load()
+    workers_needed = int(payload.get("workers_needed", 1))
+
+    if current_load > MASTER_CAPACITY:
+        reason = "high_load"
+        print(f"[MASTER] request_help recusado ({reason}) — carga atual {current_load}, capacidade {MASTER_CAPACITY}")
+        return {
+            "type": "response_rejected",
+            "request_id": request_id,
+            "payload": {"reason": reason},
+        }
+
+    idle_workers = _get_idle_workers()
+    if not idle_workers:
+        print("[MASTER] request_help recusado (no_workers_available)")
+        return {
+            "type": "response_rejected",
+            "request_id": request_id,
+            "payload": {"reason": "no_workers_available"},
+        }
+
+    target_address = _find_neighbor_address(payload.get("master_id"))
+    if not target_address:
+        print(f"[MASTER] request_help recusado (unknown_master {payload.get('master_id')})")
+        return {
+            "type": "response_rejected",
+            "request_id": request_id,
+            "payload": {"reason": "unknown_master"},
+        }
+
+    chosen = idle_workers[:min(workers_needed, len(idle_workers))]
+    worker_details = []
+    for worker in chosen:
+        _mark_worker_borrowed(worker["uuid"], borrowed=True,
+                              borrowed_to=payload.get("master_id"),
+                              original_master_address=_format_address(SERVER_HOST, PORT),
+                              pending_return=False)
+        worker_details.append({
+            "id": worker["uuid"],
+            "address": _format_address(worker["host"], worker["port"]),
+        })
+
+    print(f"[MASTER] request_help aceito — ofertando {len(worker_details)} workers")
+    response = {
+        "type": "response_accepted",
+        "request_id": request_id,
+        "payload": {
+            "workers_offered": len(worker_details),
+            "worker_details": worker_details,
+        },
+    }
+
+    # Envia os redirecionamentos em segundo plano para não bloquear o request_help.
+    def _redirect_batch():
+        for worker in chosen:
+            try:
+                _send_command_redirect(worker, target_address)
+            except Exception as exc:
+                print(f"[MASTER] Falha ao redirecionar {worker['uuid']}: {exc}")
+                _mark_worker_borrowed(worker["uuid"], borrowed=False,
+                                      borrowed_to=None,
+                                      original_master_address=None)
+
+    threading.Thread(target=_redirect_batch, daemon=True).start()
+    return response
+
+
+def _request_help_from_neighbor(neighbor, workers_needed):
+    request_id = str(uuid.uuid4())
+    payload = {
+        "type": "request_help",
+        "request_id": request_id,
+        "payload": {
+            "master_id": SERVER_UUID,
+            "current_load": _current_load(),
+            "capacity": MASTER_CAPACITY,
+            "workers_needed": workers_needed,
+        },
+    }
+    responses = _send_tcp(neighbor["host"], neighbor["port"], payload,
+                          timeout=MASTER_HELP_TIMEOUT)
+    if not responses:
+        print(f"[MASTER] Sem resposta de {neighbor['master_id']} ({neighbor['host']}:{neighbor['port']})")
+        return None
+    for resp in responses:
+        if resp.get("request_id") == request_id:
+            return resp
+    return None
+
+
+def _try_request_help():
+    if not MASTER_NEIGHBORS:
+        return
+    with help_lock:
+        current_load = _current_load()
+        if current_load <= MASTER_CAPACITY:
+            return
+        workers_needed = max(1, current_load - MASTER_CAPACITY)
+        print(f"[MASTER] Saturado: solicitando ajuda para {workers_needed} workers")
+        for neighbor in MASTER_NEIGHBORS:
+            if workers_needed <= 0:
+                break
+            response = _request_help_from_neighbor(neighbor, workers_needed)
+            if not response:
+                continue
+            if response.get("type") == "response_accepted":
+                details = response.get("payload", {}).get("worker_details", [])
+                offered = response.get("payload", {}).get("workers_offered", len(details))
+                workers_needed -= offered
+                print(f"[MASTER] {neighbor['master_id']} ofereceu {offered} workers")
+            else:
+                reason = response.get("payload", {}).get("reason", "unknown")
+                print(f"[MASTER] {neighbor['master_id']} recusou help ({reason})")
+
+
+def _release_borrowed_workers():
+    borrowed = _get_borrowed_workers()
+    if not borrowed:
+        return
+    if _current_load() >= MASTER_RELEASE_THRESHOLD:
+        return
+
+    print(f"[MASTER] Carga normalizou. Liberando {len(borrowed)} workers emprestados.")
+    for worker in borrowed:
+        original_address = worker.get("original_master_address")
+        if not original_address:
+            continue
+        request_id = str(uuid.uuid4())
+        payload = {
+            "type": "command_release",
+            "request_id": request_id,
+            "payload": {
+                "original_master_address": original_address,
+            },
+        }
+        print(f"[MASTER] Enviando command_release para {worker['uuid']} ({worker['host']}:{worker['port']})")
+        _send_tcp(worker["host"], worker["port"], payload, timeout=MASTER_HELP_TIMEOUT)
+
+        notify_payload = {
+            "type": "notify_worker_returned",
+            "request_id": str(uuid.uuid4()),
+            "payload": {
+                "worker_id": worker["uuid"],
+            },
+        }
+        try:
+            original_host, original_port = _parse_address(original_address)
+            _send_tcp(original_host, original_port, notify_payload,
+                      timeout=MASTER_HELP_TIMEOUT)
+            print(f"[MASTER] Notificado master de origem sobre retorno de {worker['uuid']}")
+        except Exception as exc:
+            print(f"[MASTER] Falha ao notificar retorno de {worker['uuid']}: {exc}")
+
+
+def _load_monitor():
+    while True:
+        try:
+            _try_request_help()
+            _release_borrowed_workers()
+        except Exception as exc:
+            print(f"[MASTER] Erro no monitor de carga: {exc}")
+        time.sleep(LOAD_MONITOR_INTERVAL)
+
 
 task_queue    = queue.Queue()
 task_log      = []          # histórico de tarefas concluídas
@@ -153,6 +499,36 @@ def handle_client(conn, addr):
                     continue
 
                 print(f"[MASTER] Recebido de {addr}: {msg}")
+
+                msg_type = msg.get("type", "").lower()
+                if msg_type:
+                    if msg_type == "request_help":
+                        response = _handle_request_help(msg)
+                        conn.send((json.dumps(response) + "\n").encode())
+                        continue
+
+                    if msg_type == "notify_worker_returned":
+                        _handle_notify_worker_returned(msg)
+                        continue
+
+                    if msg_type == "register_temporary_worker":
+                        payload = msg.get("payload", {})
+                        worker_uuid = payload.get("worker_id")
+                        original_master_address = payload.get("original_master_address")
+                        worker_host = addr[0]
+                        worker_port = payload.get("worker_port") or 8000
+                        if worker_uuid and original_master_address:
+                            _register_temporary_worker(
+                                worker_uuid,
+                                worker_host,
+                                worker_port,
+                                original_master_address,
+                            )
+                            print(f"[MASTER] Worker temporário {worker_uuid} registrado de {original_master_address}")
+                        continue
+
+                    print(f"[MASTER] Tipo desconhecido recebido: {msg_type} — ignorando")
+                    continue
 
                 # ── HEARTBEAT ─────────────────────────────────────────────────
                 if msg.get("TASK") == "HEARTBEAT":
@@ -300,6 +676,8 @@ def start_server():
     print(f"[MASTER] Servidor TCP iniciado na porta {PORT}")
     print(f"[MASTER] UUID: {SERVER_UUID}")
     print(f"[MASTER] IP: {SERVER_HOST}")
+
+    threading.Thread(target=_load_monitor, daemon=True).start()
 
     while True:
         conn, addr = srv.accept()
