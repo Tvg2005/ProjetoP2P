@@ -285,6 +285,18 @@ def send_tcp(host: str, port: int, payload: dict, timeout: int = 3):
     return msgs
 
 
+def send_udp(payload: dict, port: int | None = None):
+    """Envia payload JSON via UDP broadcast para todos os workers."""
+    if port is None:
+        port = WORKER_PORT
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(json.dumps(payload).encode(), (WORKER_BROADCAST_ADDRESS, port))
+    except Exception as exc:
+        print(f"[ELECTION] Falha ao enviar broadcast UDP: {exc}")
+
+
 def _parse_address(address: str) -> tuple[str, int]:
     if not isinstance(address, str) or ":" not in address:
         raise ValueError("Endereço inválido. Deve ser ip:porta")
