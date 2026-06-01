@@ -1,262 +1,168 @@
-# Implementação — Como Foi Feito
+﻿# Implementação — Como Foi Feito
 
-## `servidor.py` — Servidor Master
+## Visão Geral
+
+O sistema está dividido em dois componentes principais:
+- `servidor.py` — servidor master que gerencia workers, tarefas e negociação entre masters
+- `cliente.py` — worker que descobre o master, envia heartbeat, executa tarefas e participa de eleição
+
+A comunicação combina TCP para controle confiável e UDP para discovery e eleição.
+
+---
+
+## `servidor.py` — Master
 
 ### Auto-detecção de IP
 
-O servidor não usa IP fixo. Ao iniciar, detecta o próprio IP conectando um socket UDP sem enviar dados:
+O servidor detecta seu IP local abrindo um socket UDP de saída sem enviar pacotes. Isso retorna a interface correta usada para rotear tráfego para a internet local.
 
-```python
-def _detect_local_ip() -> str:
-    for remote in [("8.8.8.8", 80), ("1.1.1.1", 80)]:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(remote)           # não envia dados
-                return s.getsockname()[0]   # retorna IP da interface usada
-        except Exception:
-            pass
-```
+### Descoberta do master
 
-O truque: conectar um socket UDP a um endereço externo faz o SO escolher a interface de roteamento correta. `getsockname()` retorna o IP local usado para aquela rota — sem enviar nenhum pacote.
+O master escuta broadcasts UDP em `DISCOVERY_PORT` (`MASTER_PORT + 1`). Quando recebe `FIND_MASTER` com o `SERVER_UUID` correto, responde com `MASTER_FOUND` e o IP/porta reais do servidor.
 
-### Listener UDP de Discovery (`_start_discovery_listener`)
+### Registro de Workers e Heartbeat
 
-Escuta broadcasts `FIND_MASTER` na `DISCOVERY_PORT` (padrão: `MASTER_PORT + 1 = 8001`):
+O master mantém um registro de workers ativos e atualiza o estado a cada `HEARTBEAT`:
+- registra `WORKER_UUID`, `WORKER_HOST`, `WORKER_PORT`
+- retorna `RESPONSE: ALIVE`
+- devolve a lista de peers ativos para permitir descobertas legadas
 
-```python
-# Roda em thread daemon
-def _start_discovery_listener():
-    sock.bind(("0.0.0.0", DISCOVERY_PORT))
-    while True:
-        data, addr = sock.recvfrom(4096)
-        payload = json.loads(data.decode())
-        if payload.get("TASK") != "FIND_MASTER":
-            continue
-        # Filtra por UUID se especificado
-        requested_uuid = payload.get("SERVER_UUID", "")
-        if requested_uuid and requested_uuid != SERVER_UUID:
-            continue
-        # Responde com IP real do servidor
-        sock.sendto(json.dumps({
-            "TASK":        "MASTER_FOUND",
-            "SERVER_UUID": SERVER_UUID,
-            "MASTER_IP":   SERVER_HOST,   # IP detectado automaticamente
-            "MASTER_PORT": PORT,
-        }).encode(), addr)
-```
+### Fila de tarefas
 
-Detalhe importante: o bind é em `0.0.0.0` para receber broadcasts de qualquer interface, mas a resposta usa `SERVER_HOST` (IP real da máquina) para que o cliente possa conectar via TCP.
+`task_queue` é uma fila FIFO com 20 tarefas iniciais. Ao receber um worker válido, o master distribui a próxima tarefa disponível ou responde `TASK: NO_TASK` se a fila estiver vazia.
 
-### Registro de Workers (`registry`)
+### Resultado e ACK
 
-O master mantém um dicionário `{ worker_uuid → {uuid, host, port, last_seen} }`. Workers são registrados a cada heartbeat e removidos se `last_seen` exceder `WORKER_STALE_TIMEOUT` (30s padrão):
+Quando o worker envia `STATUS: OK` ou `STATUS: NOK`, o master:
+- registra o resultado no `task_log`
+- identifica se o worker é local ou emprestado via `SERVER_UUID`
+- devolve `STATUS: ACK`
 
-```python
-def _get_active_peers(exclude_uuid=None):
-    now = time.time()
-    stale = [u for u, w in registry.items()
-             if now - w["last_seen"] > WORKER_STALE_TIMEOUT]
-    for u in stale:
-        del registry[u]  # limpa inativos
-    return [{"uuid": w["uuid"], "host": w["host"], "port": w["port"]}
-            for u, w in registry.items() if u != exclude_uuid]
-```
+### Protocolo master-to-master
 
-### Fila de Tarefas (`task_queue`)
+O servidor implementa o protocolo de negociação de capacidade:
+- `request_help` — master saturado solicita workers a vizinhos
+- `response_accepted` / `response_rejected` — vizinho responde com oferta ou motivo de recusa
+- `command_redirect` — master vizinho instrui workers a se reportarem para o master saturado
+- `command_release` — master receptor devolve o worker ao master original
+- `notify_worker_returned` — master receptor notifica o master de origem
 
-Usa `queue.Queue` (thread-safe) do Python padrão. Populada com 20 tarefas na inicialização. Distribuição FIFO: `task_queue.get_nowait()` — se vazia, lança `queue.Empty`.
+### Monitor de carga
+
+Uma thread periódica (`_load_monitor`) avalia:
+- se o master está acima de `MASTER_CAPACITY` → solicita ajuda
+- se o master normalizou abaixo de `MASTER_RELEASE_THRESHOLD` → libera workers emprestados
+
+### Concurrency e threading
+
+Cada conexão TCP é tratada em `handle_client()` com loop de leitura contínua baseada em `\n`. Mensagens JSON são processadas em tempo real e cada socket é fechado somente ao término da conexão.
 
 ---
 
 ## `cliente.py` — Worker
 
-### Auto-detecção de Broadcast (`_detect_broadcast`)
+### Variáveis de ambiente e broadcast
 
-Mesma lógica do servidor para detectar o IP local, depois deriva o broadcast da subrede `/24`:
+O worker lê:
+- `MASTER_PORT`
+- `WORKER_PORT`
+- `SERVER_UUID`
+- `WORKER_BROADCAST_ADDRESS` opcional
 
-```python
-def _detect_broadcast(local_ip: str) -> str:
-    env_val = os.getenv("WORKER_BROADCAST_ADDRESS", "")
-    if env_val and env_val != "255.255.255.255":
-        return env_val   # respeita configuração manual
-    prefix = ".".join(local_ip.split(".")[:3])
-    return f"{prefix}.255"   # 10.62.206.23 → 10.62.206.255
-```
+Ele auto-detecta o endereço de broadcast da subrede `/24` quando `WORKER_BROADCAST_ADDRESS` não é fornecido.
 
-### Discovery do Master (`discover_master`)
+### Descoberta do master
 
-Envia `FIND_MASTER` via broadcast UDP e aguarda `MASTER_FOUND` com o IP real do servidor:
+`discover_master()` envia `FIND_MASTER` via UDP broadcast e aguarda `MASTER_FOUND`. Isso elimina a necessidade de `MASTER_IP` fixo no `.env`.
 
-```python
-def discover_master(retries=3, timeout=3.0):
-    request = json.dumps({
-        "TASK":        "FIND_MASTER",
-        "SERVER_UUID": ORIGINAL_SERVER_UUID,
-        "WORKER_UUID": WORKER_UUID,
-    }).encode()
+### Heartbeat e apresentação
 
-    for attempt in range(1, retries + 1):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.settimeout(timeout)
-            s.sendto(request, (WORKER_BROADCAST_ADDRESS, DISCOVERY_PORT))
+O worker envia `HEARTBEAT` periódico para o master e, no ciclo de tarefa, apresenta-se com `WORKER: ALIVE`.
+Se o master original não corresponde a `ORIGINAL_SERVER_UUID`, o worker marca-se como emprestado e inclui `SERVER_UUID` no payload.
 
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                data, addr = s.recvfrom(4096)
-                resp = json.loads(data.decode())
-                if (resp.get("TASK") == "MASTER_FOUND"
-                        and resp.get("SERVER_UUID") == ORIGINAL_SERVER_UUID):
-                    return (resp["MASTER_IP"], resp["MASTER_PORT"])
-    return None
-```
+### Eleição via broadcast
 
-Chamada em `start_worker()` antes do primeiro heartbeat. Se falhar após `retries=5` tentativas, encerra com `SystemExit(1)` e mensagem de erro clara.
+Ao detectar falha do master, o worker executa `_trigger_election_with_delay()`:
+- aguarda `ELECTION_DELAY` para cancelar caso `NEW_MASTER` chegue
+- inicia `start_election_broadcast()` se não houver novo master
+- envia `ELECTION_BROADCAST` para a subrede
+- coleta `ELECTION_RESPONSE` por `ELECTION_COLLECT_TIMEOUT`
+- ordena candidatos por `(-free_space, WORKER_UUID)`
+- vencedor vira master e envia `NEW_MASTER`
 
-### Eleição via Broadcast (`start_election_broadcast`)
+### Tornar-se master
 
-Função central da eleição. Roda em thread separada após `_trigger_election_with_delay`:
+O worker vencedor invoca `_become_master()`:
+- atualiza estado local
+- encerra servidor de status local
+- inicia `servidor.py` como subprocesso
+- aguarda bind na porta master
 
-```python
-def start_election_broadcast():
-    # Guarda de entrada única
-    with state_lock:
-        if is_master or election_in_progress:
-            return
-        election_in_progress = True
-        failed_hb = 0
+Após subir, `_notify_new_master()` envia `NEW_MASTER` por UDP broadcast.
 
-    candidates = [{"WORKER_UUID": WORKER_UUID, "WORKER_HOST": WORKER_HOST,
-                   "WORKER_PORT": WORKER_PORT, "FREE_SPACE": get_free_space()}]
+### Redirecionamento e retorno
 
-    # Abre socket efêmero — respostas vêm de volta a esse socket
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.settimeout(ELECTION_COLLECT_TIMEOUT)
-        s.sendto(json.dumps({
-            "TASK": "ELECTION_BROADCAST", ...
-        }).encode(), (WORKER_BROADCAST_ADDRESS, WORKER_PORT))
+O worker processa comandos recebidos pelo servidor TCP de status:
+- `command_redirect` → define `redirect_target` e reconecta ao novo master como `register_temporary_worker`
+- `command_release` → define `return_target` e reconecta ao master original
 
-        # Coleta ELECTION_RESPONSE por ELECTION_COLLECT_TIMEOUT segundos
-        deadline = time.time() + ELECTION_COLLECT_TIMEOUT
-        while time.time() < deadline:
-            data, _ = s.recvfrom(4096)
-            resp = json.loads(data.decode())
-            if resp.get("TASK") == "ELECTION_RESPONSE":
-                candidates.append(resp)
+`_connect_to_master(..., register_temporary=True)` envia `register_temporary_worker` com `original_master_address`.
 
-    candidates.sort(key=_election_key)   # determinístico
-    winner = candidates[0]
+### Listener UDP
 
-    if winner["WORKER_UUID"] == WORKER_UUID:
-        _become_master()
-        _notify_new_master()   # broadcast NEW_MASTER
-    else:
-        received = new_master_event.wait(timeout=NEW_MASTER_WAIT)
-        if not received:
-            threading.Thread(target=start_election_broadcast, daemon=True).start()
-```
+O worker mantém um listener UDP permanente em `WORKER_PORT` para:
+- responder a `ELECTION_BROADCAST`
+- processar `NEW_MASTER`
+- responder a `DISCOVER_WORKER` (compatibilidade)
 
-**Detalhe crítico: socket efêmero**
-O ELECTION_BROADCAST é enviado de um socket efêmero (porta aleatória). Os workers respondem com `ELECTION_RESPONSE` para o endereço de origem — ou seja, voltam para a porta efêmera, não para o `WORKER_PORT` fixo. Isso evita conflito com o listener UDP permanente.
+### Estado e sincronização
 
-### Resposta a ELECTION_BROADCAST (UDP Listener)
+O código usa `state_lock` para proteger:
+- `is_master`
+- `election_in_progress`
+- `current_master`
+- `redirect_target` / `return_target`
 
-O `_start_udp_listener` roda em thread permanente e responde a broadcasts de eleição:
-
-```python
-if task == "ELECTION_BROADCAST":
-    sender_uuid = payload.get("WORKER_UUID")
-    if sender_uuid == WORKER_UUID:
-        continue  # ignora eco do próprio broadcast
-    sock.sendto(json.dumps({
-        "TASK":        "ELECTION_RESPONSE",
-        "WORKER_UUID": WORKER_UUID,
-        "WORKER_HOST": WORKER_HOST,
-        "WORKER_PORT": WORKER_PORT,
-        "FREE_SPACE":  get_free_space(),
-    }).encode(), addr)   # addr = porta efêmera do remetente
-```
-
-### Delay antes da Eleição (`_trigger_election_with_delay`)
-
-Chamada quando heartbeats falham. Aguarda `ELECTION_DELAY` segundos usando `threading.Event.wait()`:
-
-```python
-def _trigger_election_with_delay():
-    new_master_event.clear()
-    received = new_master_event.wait(timeout=ELECTION_DELAY)
-    if received:
-        return  # NEW_MASTER chegou durante a espera → cancela
-    threading.Thread(target=start_election_broadcast, daemon=True).start()
-```
-
-O `new_master_event` é um `threading.Event` global. Se outro worker já elegeu um master e enviou `NEW_MASTER` via broadcast, o listener UDP chama `_accept_new_master()` que faz `new_master_event.set()`, cancelando o delay.
-
-### Tornar-se Master (`_become_master` + `_notify_new_master`)
-
-```python
-def _become_master():
-    with state_lock:
-        is_master = True
-        current_master.update({"uuid": WORKER_UUID, "ip": WORKER_HOST, "port": WORKER_PORT})
-
-    # Sobe servidor.py como subprocesso com o UUID deste worker
-    env = os.environ.copy()
-    env.update({"MASTER_IP": WORKER_HOST, "MASTER_PORT": str(WORKER_PORT),
-                "SERVER_UUID": WORKER_UUID})
-    master_proc = subprocess.Popen(["python", "servidor.py"], env=env)
-
-def _notify_new_master():
-    send_udp({"TASK": "NEW_MASTER", "MASTER_HOST": WORKER_HOST,
-              "MASTER_PORT": WORKER_PORT, "MASTER_UUID": WORKER_UUID, ...})
-```
-
-`servidor.py` sobe como processo filho, herdando as variáveis de ambiente atualizadas. O listener UDP de discovery do novo servidor passa a responder broadcasts `FIND_MASTER` com o novo IP.
+`new_master_event` sincroniza espera de eleição com a chegada de `NEW_MASTER`.
 
 ---
 
-## Threading e Concorrência
+## Padrões de protocolo
 
-### Threads por Worker
+### Delimitador de mensagem TCP
 
-| Thread | Função | Tipo |
-|---|---|---|
-| Principal | `start_worker()`, loop `schedule` | Permanente |
-| UDP Listener | `_start_udp_listener()` | Daemon permanente |
-| TCP Status Server | `_start_status_server()` | Daemon permanente |
-| Heartbeat | via `schedule` → `enviar_heartbeat()` | Periódica |
-| Tarefas | via `schedule` → `pedir_tarefa()` | Periódica |
-| Eleição | `_trigger_election_with_delay()` → `start_election_broadcast()` | Sob demanda |
+- Cada objeto JSON termina com `\n`
+- O receptor acumula bytes até encontrar `\n`
+- Esta abordagem garante que múltiplas mensagens no mesmo socket sejam lidas corretamente
 
-### `state_lock` (threading.Lock)
+### Campos obrigatórios e extensibilidade
 
-Protege as variáveis de estado global compartilhadas:
-- `failed_hb` — contador de heartbeats falhos
-- `is_master` — se este nó é o master atual
-- `election_in_progress` — flag para evitar eleições simultâneas
-- `current_master` — dicionário `{uuid, ip, port}` do master atual
+- Campos desconhecidos são ignorados para suportar futuras extensões
+- Campos obrigatórios são validados antes do processamento
+- Valores de controle são tratados em caixa alta (`ALIVE`, `QUERY`, `NO_TASK`, `OK`, `NOK`, `ACK`)
 
-### `new_master_event` (threading.Event)
+### Envelope master-to-master
 
-Sincroniza `_trigger_election_with_delay()` com `_accept_new_master()`:
-- `.clear()` → reseta antes da espera
-- `.wait(timeout)` → bloqueia até evento ou timeout
-- `.set()` → disparado pelo UDP listener quando NEW_MASTER chega
+Exemplo genérico:
+```json
+{
+  "type": "request_help",
+  "request_id": "uuid_unico_para_rastreio",
+  "payload": { ... }
+}
+```
 
 ---
 
-## Código Legado Comentado
+## Status da implementação
 
-O código das versões anteriores foi comentado (não deletado) com marcador `# [LEGADO]`:
+O código atual implementa os principais elementos do SDD:
+- descoberta de master via UDP
+- heartbeat e registro de workers
+- fila FIFO de tarefas
+- apresentação de workers e resultado com ACK
+- eleição automática de novo master via broadcast
+- redirecionamento de workers entre masters
+- devolução de workers e notificação de retorno
 
-| Bloco comentado | Localização | Substituído por |
-|---|---|---|
-| `WORKER_PEERS_STR` | linha ~46 | Broadcast auto-discovery |
-| `_parse_peers()` | linha ~66 | Não necessário |
-| `STATIC_PEERS` | linha ~115 | `known_peers = []` |
-| `_update_known_peers()` | linha ~250 | Peers não são mais aprendidos |
-| `get_peers()` | linha ~270 | `start_election_broadcast()` usa broadcast |
-| `_query_status()` + `start_election()` | linha ~313 | `start_election_broadcast()` |
-| Loop TCP em `_notify_new_master()` | linha ~450 | `send_udp()` broadcast |
-| `_update_known_peers()` em heartbeat | linha ~649 | Comentado |
+Essa documentação serve tanto como guia de implementação quanto como SDD para futuras evoluções.
