@@ -236,6 +236,7 @@ is_master            = False
 election_in_progress = False
 master_proc          = None          # subprocess do servidor.py quando eleito
 new_master_event     = threading.Event()  # sinalizado quando NEW_MASTER chega
+status_srv           = None          # socket do status server (para poder fechar ao virar master)
 
 current_master = {
     "uuid": ORIGINAL_SERVER_UUID or "MASTER",
@@ -583,13 +584,38 @@ def _become_master():
     })
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "servidor.py")
 
+    # Fecha o status server local (libera a porta) antes de iniciar o servidor
     if os.path.exists(script):
         try:
+            try:
+                _stop_status_server()
+            except Exception:
+                pass
+
             master_proc = subprocess.Popen(
                 ["python", script], env=env,
                 cwd=os.path.dirname(script),
             )
             print(f"[ELECTION] servidor.py iniciado (PID {master_proc.pid})")
+
+            # Aguarda o servidor master bindar na porta (timeout razoável)
+            ready = False
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if master_proc.poll() is not None:
+                    print(f"[ELECTION] servidor.py terminou inesperadamente (exit={master_proc.returncode})")
+                    break
+                try:
+                    with socket.create_connection((WORKER_HOST, WORKER_PORT), timeout=1):
+                        ready = True
+                        break
+                except Exception:
+                    time.sleep(0.3)
+
+            if ready:
+                print("[ELECTION] servidor.py está ouvindo — pronto como master.")
+            else:
+                print("[ELECTION] Aviso: servidor.py não confirmou bind na porta dentro do timeout.")
         except Exception as exc:
             print(f"[ELECTION] Falha ao iniciar servidor.py: {exc}")
     else:
@@ -722,15 +748,47 @@ def _handle_conn(conn, addr):
 
 
 def _start_status_server():
+    global status_srv
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((WORKER_HOST, WORKER_PORT))
-    srv.listen()
-    print(f"[STATUS] Servidor TCP em {WORKER_HOST}:{WORKER_PORT}")
+    try:
+        srv.bind((WORKER_HOST, WORKER_PORT))
+        srv.listen()
+        status_srv = srv
+        print(f"[STATUS] Servidor TCP em {WORKER_HOST}:{WORKER_PORT}")
+    except Exception as exc:
+        print(f"[STATUS] Falha ao iniciar servidor TCP: {exc}")
+        try:
+            srv.close()
+        except Exception:
+            pass
+        return
+
     while True:
-        conn, addr = srv.accept()
+        try:
+            conn, addr = srv.accept()
+        except OSError:
+            # Socket fechado — encerra o servidor de status
+            print("[STATUS] Socket de status fechado — encerrando servidor de status.")
+            break
+        except Exception as exc:
+            print(f"[STATUS] Erro em accept(): {exc}")
+            break
+
         threading.Thread(target=_handle_conn, args=(conn, addr),
                          daemon=True).start()
+
+
+def _stop_status_server():
+    """Fecha o socket do servidor de status para liberar a porta quando virar master."""
+    global status_srv
+    if status_srv:
+        try:
+            status_srv.close()
+            print(f"[STATUS] Servidor de status fechado (porta {WORKER_PORT}).")
+        except Exception as exc:
+            print(f"[STATUS] Erro ao fechar servidor de status: {exc}")
+        status_srv = None
 
 
 # ── Listener UDP (discovery + NEW_MASTER via broadcast) ──────────────────────
