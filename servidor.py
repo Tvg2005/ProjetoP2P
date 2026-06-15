@@ -5,7 +5,16 @@ import socket
 import threading
 import time
 import uuid
+import datetime
+import ssl
+import platform
+import shutil
 from dotenv import load_dotenv
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 load_dotenv()
 
@@ -27,6 +36,28 @@ MASTER_CAPACITY = int(os.getenv("MASTER_CAPACITY", "100"))
 MASTER_RELEASE_THRESHOLD = int(os.getenv("MASTER_RELEASE_THRESHOLD", "60"))
 MASTER_HELP_TIMEOUT = int(os.getenv("MASTER_HELP_TIMEOUT", "5"))
 LOAD_MONITOR_INTERVAL = int(os.getenv("LOAD_MONITOR_INTERVAL", "5"))
+
+# ── Supervisor configuration ──
+SUPERVISOR_HOST = os.getenv("SUPERVISOR_HOST", "nuted-ia.dev")
+SUPERVISOR_PORT = int(os.getenv("SUPERVISOR_PORT", "443"))
+SUPERVISOR_TLS = os.getenv("SUPERVISOR_TLS", "true").lower() in ("1", "true", "yes")
+SUPERVISOR_SNI = os.getenv("SUPERVISOR_SNI", "nuted-ia.dev")
+SUPERVISOR_INTERVAL = int(os.getenv("SUPERVISOR_INTERVAL", "10"))
+SUPERVISOR_PAYLOAD_VERSION = os.getenv("SUPERVISOR_PAYLOAD_VERSION", "sprint4-monitor")
+
+# ── Telemetry global variables ──
+server_start_time = time.time()
+cpu_history = []
+cpu_history_lock = threading.Lock()
+
+# Thread-safe running tasks tracking
+running_tasks = {}
+running_tasks_lock = threading.Lock()
+
+# Counters for completed/failed tasks
+tasks_completed_count = 0
+tasks_failed_count = 0
+tasks_stats_lock = threading.Lock()
 
 
 def _detect_local_ip() -> str:
@@ -132,6 +163,33 @@ print(f"[MASTER] Broadcast de descoberta: {BROADCAST_ADDR}")
 MASTER_NEIGHBORS = _parse_neighbors(MASTER_NEIGHBORS_RAW)
 help_lock = threading.Lock()
 
+# Initialize neighbor states for tracking liveness
+neighbor_states = {
+    n["master_id"]: {
+        "status": "unavailable",
+        "last_heartbeat": None
+    }
+    for n in MASTER_NEIGHBORS
+}
+neighbor_states_lock = threading.Lock()
+
+def _update_neighbor_state(master_id: str, status: str):
+    with neighbor_states_lock:
+        if master_id in neighbor_states:
+            neighbor_states[master_id]["status"] = status
+            if status == "available":
+                neighbor_states[master_id]["last_heartbeat"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _find_neighbor_id_by_address(address: str) -> str | None:
+    try:
+        host, port = _parse_address(address)
+        for neighbor in MASTER_NEIGHBORS:
+            if neighbor["host"] == host and neighbor["port"] == port:
+                return neighbor["master_id"]
+    except Exception:
+        pass
+    return None
+
 # ── Registro de workers ───────────────────────────────────────────────────────
 # { worker_uuid: {uuid, host, port, last_seen, busy, borrowed, origin_master_id, original_master_address, borrowed_to}} 
 
@@ -160,19 +218,15 @@ def _register_worker(uuid, host, port, borrowed=None,
 
 
 def _get_active_peers(exclude_uuid=None):
-    """Retorna lista de workers ativos, removendo os inativos."""
+    """Retorna lista de workers ativos, mantendo os inativos no registro para telemetria."""
     now = time.time()
     with registry_lock:
-        stale = [u for u, w in registry.items()
-                 if now - w["last_seen"] > WORKER_STALE_TIMEOUT]
-        for u in stale:
-            print(f"[MASTER] Worker {u} removido do registro (inativo).")
-            del registry[u]
-
         return [
             {"uuid": w["uuid"], "host": w["host"], "port": w["port"]}
             for u, w in registry.items()
-            if u != exclude_uuid and not w.get("borrowed", False)
+            if u != exclude_uuid 
+            and (now - w["last_seen"] <= WORKER_STALE_TIMEOUT)
+            and not w.get("borrowed", False)
         ]
 
 
@@ -180,25 +234,22 @@ def _get_idle_workers():
     """Retorna workers locais disponíveis para ceder ou para tarefa."""
     now = time.time()
     with registry_lock:
-        stale = [u for u, w in registry.items()
-                 if now - w["last_seen"] > WORKER_STALE_TIMEOUT]
-        for u in stale:
-            print(f"[MASTER] Worker {u} removido do registro (inativo).")
-            del registry[u]
-
         return [
             w for w in registry.values()
-            if not w.get("busy", False)
+            if (now - w["last_seen"] <= WORKER_STALE_TIMEOUT)
+            and not w.get("busy", False)
             and not w.get("borrowed", False)
             and not w.get("pending_return", False)
         ]
 
 
 def _get_borrowed_workers():
+    now = time.time()
     with registry_lock:
         return [
             w for w in registry.values()
-            if w.get("borrowed", False)
+            if (now - w["last_seen"] <= WORKER_STALE_TIMEOUT)
+            and w.get("borrowed", False)
         ]
 
 
@@ -366,7 +417,9 @@ def _request_help_from_neighbor(neighbor, workers_needed):
                           timeout=MASTER_HELP_TIMEOUT)
     if not responses:
         print(f"[MASTER] Sem resposta de {neighbor['master_id']} ({neighbor['host']}:{neighbor['port']})")
+        _update_neighbor_state(neighbor["master_id"], "unavailable")
         return None
+    _update_neighbor_state(neighbor["master_id"], "available")
     for resp in responses:
         if resp.get("request_id") == request_id:
             return resp
@@ -453,7 +506,7 @@ task_log_lock = threading.Lock()
 
 # Popula fila com tarefas iniciais de exemplo
 _INITIAL_TASKS = [
-    {"id": f"task-{i:03d}", "USER": f"user{i}"}
+    {"id": f"task-{i:03d}", "USER": f"user{i}", "created_at": time.time()}
     for i in range(1, 21)
 ]
 for _t in _INITIAL_TASKS:
@@ -464,6 +517,7 @@ print(f"[MASTER] Fila iniciada com {task_queue.qsize()} tarefas.")
 
 def _log_task(worker_uuid, task_id, status, origin):
     """Registra conclusão de tarefa no log."""
+    global tasks_completed_count, tasks_failed_count
     entry = {
         "worker":    worker_uuid,
         "task_id":   task_id,
@@ -473,8 +527,276 @@ def _log_task(worker_uuid, task_id, status, origin):
     }
     with task_log_lock:
         task_log.append(entry)
+    with tasks_stats_lock:
+        if status == "OK":
+            tasks_completed_count += 1
+        elif status == "NOK":
+            tasks_failed_count += 1
     print(f"[MASTER] LOG | Worker={worker_uuid} ({origin}) | "
           f"Task={task_id} | Status={status}")
+
+
+# ── Telemetry & Metrics Helpers ──
+
+def _get_oldest_task_age() -> int:
+    now = time.time()
+    oldest_time = now
+    
+    with task_queue.mutex:
+        for t in task_queue.queue:
+            created = t.get("created_at")
+            if created and created < oldest_time:
+                oldest_time = created
+                
+    with running_tasks_lock:
+        for t_info in running_tasks.values():
+            created = t_info.get("task", {}).get("created_at")
+            if created and created < oldest_time:
+                oldest_time = created
+                
+    if oldest_time < now:
+        return int(now - oldest_time)
+    return 0
+
+
+def _get_system_metrics():
+    now = time.time()
+    metrics = {
+        "uptime_seconds": int(now - server_start_time),
+        "load_average_1m": 0.0,
+        "load_average_5m": 0.0,
+        "cpu": {
+            "usage_percent": 0.0,
+            "count_logical": os.cpu_count() or 1,
+            "count_physical": os.cpu_count() or 1,
+        },
+        "memory": {
+            "total_mb": 0,
+            "available_mb": 0,
+            "percent_used": 0.0,
+            "memory_used": 0,
+        },
+        "disk": {
+            "total_gb": 0.0,
+            "free_gb": 0.0,
+            "percent_used": 0.0,
+        }
+    }
+    
+    # Disk
+    try:
+        du = shutil.disk_usage(".")
+        metrics["disk"]["total_gb"] = round(du.total / (1024**3), 2)
+        metrics["disk"]["free_gb"] = round(du.free / (1024**3), 2)
+        metrics["disk"]["percent_used"] = round((du.used / du.total) * 100, 2)
+    except Exception:
+        pass
+        
+    # CPU & Memory
+    if psutil:
+        try:
+            metrics["cpu"]["usage_percent"] = round(psutil.cpu_percent(), 2)
+            metrics["cpu"]["count_logical"] = psutil.cpu_count(logical=True) or os.cpu_count() or 1
+            metrics["cpu"]["count_physical"] = psutil.cpu_count(logical=False) or os.cpu_count() or 1
+        except Exception:
+            pass
+            
+        if hasattr(os, "getloadavg"):
+            try:
+                avg = os.getloadavg()
+                metrics["load_average_1m"] = round(avg[0], 2)
+                metrics["load_average_5m"] = round(avg[1], 2)
+            except Exception:
+                pass
+        else:
+            try:
+                cpu_count = metrics["cpu"]["count_logical"]
+                with cpu_history_lock:
+                    if cpu_history:
+                        avg_1m = sum(cpu_history[-6:]) / len(cpu_history[-6:])
+                        metrics["load_average_1m"] = round((avg_1m / 100) * cpu_count, 2)
+                        avg_5m = sum(cpu_history) / len(cpu_history)
+                        metrics["load_average_5m"] = round((avg_5m / 100) * cpu_count, 2)
+            except Exception:
+                pass
+                
+        try:
+            mem = psutil.virtual_memory()
+            metrics["memory"]["total_mb"] = int(mem.total / (1024**2))
+            metrics["memory"]["available_mb"] = int(mem.available / (1024**2))
+            metrics["memory"]["percent_used"] = round(mem.percent, 2)
+            metrics["memory"]["memory_used"] = int((mem.total - mem.available) / (1024**2))
+        except Exception:
+            pass
+            
+    return metrics
+
+
+def _get_farm_state():
+    now = time.time()
+    
+    total_registered = len(registry)
+    
+    with registry_lock:
+        workers_alive_list = [w for w in registry.values() if now - w["last_seen"] <= WORKER_STALE_TIMEOUT]
+        workers_alive = len(workers_alive_list)
+        workers_utilization = sum(1 for w in workers_alive_list if w.get("busy"))
+        
+        workers_borrowed = sum(1 for w in workers_alive_list if w.get("borrowed") and w.get("borrowed_to"))
+        workers_received = sum(1 for w in workers_alive_list if w.get("borrowed") and not w.get("borrowed_to"))
+        workers_home = sum(1 for w in workers_alive_list if not w.get("borrowed"))
+        
+        borrowed_workers_payload = []
+        for w in workers_alive_list:
+            if w.get("borrowed"):
+                if w.get("borrowed_to"):
+                    borrowed_workers_payload.append({
+                        "direction": "out",
+                        "peer_uuid": w.get("borrowed_to")
+                    })
+                elif w.get("original_master_address"):
+                    peer_uuid = _find_neighbor_id_by_address(w.get("original_master_address")) or "unknown"
+                    borrowed_workers_payload.append({
+                        "direction": "in",
+                        "peer_uuid": peer_uuid
+                    })
+                    
+    workers_failed = max(0, total_registered - workers_alive)
+    workers_idle = max(0, workers_alive - workers_utilization)
+    workers_available_capacity = workers_idle
+    
+    tasks_pending = task_queue.qsize()
+    with running_tasks_lock:
+        tasks_running = len(running_tasks)
+        
+    with tasks_stats_lock:
+        tasks_completed = tasks_completed_count
+        tasks_failed_tasks = tasks_failed_count
+        
+    oldest_task_age = _get_oldest_task_age()
+    
+    return {
+        "workers": {
+            "total_registered": total_registered,
+            "workers_utilization": workers_utilization,
+            "workers_alive": workers_alive,
+            "workers_idle": workers_idle,
+            "workers_borrowed": workers_borrowed,
+            "workers_received": workers_received,
+            "workers_failed": workers_failed,
+            "workers_home": workers_home,
+            "workers_available_capacity": workers_available_capacity,
+            "borrowed_workers": borrowed_workers_payload,
+        },
+        "tasks": {
+            "tasks_pending": tasks_pending,
+            "tasks_running": tasks_running,
+            "tasks_completed": tasks_completed,
+            "tasks_failed": tasks_failed_tasks,
+            "oldest_task_age_s": oldest_task_age,
+        }
+    }
+
+
+def _get_neighbors_payload():
+    payload = []
+    with neighbor_states_lock:
+        for master_id, state in neighbor_states.items():
+            payload.append({
+                "server_uuid": master_id,
+                "status": state["status"],
+                "last_heartbeat": state["last_heartbeat"] or datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            })
+    return payload
+
+
+# ── Background Telemetry Services ──
+
+def _cpu_history_updater():
+    while True:
+        try:
+            if psutil:
+                cpu = psutil.cpu_percent()
+            else:
+                cpu = 0.0
+            with cpu_history_lock:
+                cpu_history.append(cpu)
+                if len(cpu_history) > 30:
+                    cpu_history.pop(0)
+        except Exception:
+            pass
+        time.sleep(10)
+
+
+def _neighbor_monitor():
+    while True:
+        for neighbor in MASTER_NEIGHBORS:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(2.0)
+                    s.connect((neighbor["host"], neighbor["port"]))
+                _update_neighbor_state(neighbor["master_id"], "available")
+            except Exception:
+                _update_neighbor_state(neighbor["master_id"], "unavailable")
+        time.sleep(10)
+
+
+def _supervisor_sender():
+    print(f"[SUPERVISOR] Thread iniciada. Host={SUPERVISOR_HOST}:{SUPERVISOR_PORT}, TLS={SUPERVISOR_TLS}")
+    while True:
+        try:
+            sys_metrics = _get_system_metrics()
+            farm_metrics = _get_farm_state()
+            neighbors_metrics = _get_neighbors_payload()
+            
+            payload = {
+                "server_uuid": SERVER_UUID,
+                "hostname": socket.gethostname(),
+                "role": "master",
+                "task": "performance_report",
+                "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "message_id": str(uuid.uuid4()),
+                "payload_version": SUPERVISOR_PAYLOAD_VERSION,
+                "performance": {
+                    "system": sys_metrics,
+                    "farm_state": farm_metrics,
+                    "config_thresholds": {
+                        "max_task": MASTER_CAPACITY,
+                        "warn_cpu_percent": 85,
+                        "warn_memory_percent": 85,
+                        "release_task": MASTER_RELEASE_THRESHOLD,
+                    },
+                    "neighbors": neighbors_metrics
+                }
+            }
+            
+            _send_to_supervisor(payload)
+            
+        except Exception as e:
+            print(f"[SUPERVISOR] Erro no coletor/enviador: {e}")
+            
+        time.sleep(SUPERVISOR_INTERVAL)
+
+
+def _send_to_supervisor(payload):
+    sock = None
+    try:
+        sock = socket.create_connection((SUPERVISOR_HOST, SUPERVISOR_PORT), timeout=5.0)
+        if SUPERVISOR_TLS:
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=SUPERVISOR_SNI)
+            
+        msg = json.dumps(payload) + "\n"
+        sock.sendall(msg.encode("utf-8"))
+        print(f"[SUPERVISOR] Relatório de desempenho enviado com sucesso ({SUPERVISOR_HOST}:{SUPERVISOR_PORT}).")
+    except Exception as e:
+        print(f"[SUPERVISOR] Erro ao enviar para o supervisor: {e}")
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 # ── Handler de conexão ────────────────────────────────────────────────────────
@@ -565,6 +887,15 @@ def handle_client(conn, addr):
                         current_task = task_queue.get_nowait()
                         print(f"[MASTER] Distribuindo {current_task['id']} "
                               f"→ {worker_uuid}")
+                        
+                        # Track task in running tasks
+                        with running_tasks_lock:
+                            running_tasks[current_task["id"]] = {
+                                "task": current_task,
+                                "worker_uuid": worker_uuid,
+                                "started_at": time.time(),
+                            }
+                            
                         # Payload 2.2
                         conn.send((json.dumps({
                             "TASK":    "QUERY",
@@ -573,12 +904,12 @@ def handle_client(conn, addr):
                         }) + "\n").encode())
 
                     except queue.Empty:
-                        print(f"[MASTER] Fila vazia para {worker_uuid}")
-                        # Payload 2.3
-                        conn.send((json.dumps({
-                            "TASK": "NO_TASK",
-                        }) + "\n").encode())
-                        current_task = None
+                         print(f"[MASTER] Fila vazia para {worker_uuid}")
+                         # Payload 2.3
+                         conn.send((json.dumps({
+                             "TASK": "NO_TASK",
+                         }) + "\n").encode())
+                         current_task = None
 
                 # ── RESULTADO DO WORKER (Payload 2.4) ─────────────────────────
                 elif msg.get("STATUS") in ("OK", "NOK") and msg.get("TASK") == "QUERY":
@@ -591,6 +922,11 @@ def handle_client(conn, addr):
                     origin = f"emprestado de {origin_uuid}" if origin_uuid else "local"
 
                     _log_task(worker_uuid, task_id, status, origin)
+
+                    # Remove from running tasks
+                    if current_task:
+                        with running_tasks_lock:
+                            running_tasks.pop(current_task["id"], None)
 
                     # Payload 2.5 — ACK imediato
                     conn.send((json.dumps({
@@ -609,6 +945,11 @@ def handle_client(conn, addr):
     except Exception as exc:
         print(f"[MASTER] Erro com {addr}: {exc}")
     finally:
+        if current_task:
+            print(f"[MASTER] Conexão com {addr} perdida. Devolvendo tarefa {current_task['id']} à fila.")
+            task_queue.put(current_task)
+            with running_tasks_lock:
+                running_tasks.pop(current_task["id"], None)
         conn.close()
         print(f"[MASTER] Conexão encerrada: {addr}")
 
@@ -678,6 +1019,11 @@ def start_server():
     print(f"[MASTER] IP: {SERVER_HOST}")
 
     threading.Thread(target=_load_monitor, daemon=True).start()
+    
+    # Inicia threads de monitoramento de CPU, vizinhos e envio de telemetria ao supervisor
+    threading.Thread(target=_cpu_history_updater, daemon=True).start()
+    threading.Thread(target=_neighbor_monitor, daemon=True).start()
+    threading.Thread(target=_supervisor_sender, daemon=True).start()
 
     while True:
         conn, addr = srv.accept()

@@ -27,6 +27,12 @@ Cada máquina (master e workers) precisa de um arquivo `.env` na raiz do projeto
 | `MASTER_RELEASE_THRESHOLD` | ❌ | `60` | Limite abaixo do qual um master libera workers emprestados de volta ao mestre original. Deve ser menor que `MASTER_CAPACITY` para evitar ping-pong. |
 | `MASTER_HELP_TIMEOUT` | ❌ | `5` | Timeout em segundos para aguardar resposta a `request_help` de um master vizinho. |
 | `LOAD_MONITOR_INTERVAL` | ❌ | `5` | Intervalo em segundos para o master verificar carga e disparar `request_help` ou `command_release`. |
+| `SUPERVISOR_HOST` | ❌ | `"nuted-ia.dev"` | Endereço do host do supervisor de métricas. |
+| `SUPERVISOR_PORT` | ❌ | `443` | Porta TCP do supervisor de métricas. |
+| `SUPERVISOR_TLS` | ❌ | `true` | Define se a conexão TCP com o supervisor usará criptografia TLS. |
+| `SUPERVISOR_SNI` | ❌ | `"nuted-ia.dev"` | Server Name Indication (SNI) usado na negociação TLS. |
+| `SUPERVISOR_INTERVAL` | ❌ | `10` | Intervalo em segundos entre cada envio de telemetria. |
+| `SUPERVISOR_PAYLOAD_VERSION` | ❌ | `"sprint4-monitor"` | Versão do schema de dados a ser enviado para o supervisor. |
 
 ---
 
@@ -78,6 +84,14 @@ Cada máquina (master e workers) precisa de um arquivo `.env` na raiz do projeto
 SERVER_UUID=SRV-MASTER
 MASTER_PORT=8000
 DISCOVERY_PORT=8001
+
+# ── Supervisor de Métricas (Sprint 4) ──
+SUPERVISOR_HOST=nuted-ia.dev
+SUPERVISOR_PORT=443
+SUPERVISOR_TLS=true
+SUPERVISOR_SNI=nuted-ia.dev
+SUPERVISOR_INTERVAL=10
+SUPERVISOR_PAYLOAD_VERSION=sprint4-monitor
 ```
 
 ## Exemplo Completo — Worker 1

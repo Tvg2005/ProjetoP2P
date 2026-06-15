@@ -1,4 +1,4 @@
-﻿# Implementação — Como Foi Feito
+# Implementação — Como Foi Feito
 
 ## Visão Geral
 
@@ -154,15 +154,34 @@ Exemplo genérico:
 
 ---
 
+## Sprint 4 — Supervisor de Métricas e Telemetria
+
+### Coleta de métricas de hardware e SO
+
+O master coleta métricas usando a biblioteca `psutil` com fallbacks robustos para a biblioteca padrão (`shutil`, `os` e `platform`):
+- **CPU e RAM:** O master utiliza `psutil.cpu_percent` e `psutil.virtual_memory` para obter o consumo instantâneo.
+- **Emulação de Load Average:** Como o Windows não suporta `os.getloadavg()`, o master mantém um histórico deslizante de uso de CPU a cada 10s e calcula a carga média equivalente multiplicando pelo número de processadores lógicos.
+- **Espaço em Disco:** Obtido via `shutil.disk_usage()`, funcionando nativamente em qualquer SO.
+
+### Telemetria da Farm e Conectividade P2P
+
+- **Estado dos Workers:** O dicionário `registry` mantém o registro dos workers. Workers inativos (stale) não são deletados imediatamente para que o supervisor possa reportar `workers_failed`. O master filtra workers inativos nas buscas de fila e negociações de empréstimo.
+- **Liveness de Vizinhos:** Uma thread de monitoramento (`_neighbor_monitor`) tenta se conectar a cada nó em `MASTER_NEIGHBORS` a cada 10s para validar o status (`available` ou `unavailable`) e registrar o último timestamp de atividade.
+- **Idade da Tarefa mais Antiga:** Calculada verificando o menor timestamp `created_at` nas tarefas pendentes em `task_queue` ou executando em `running_tasks`.
+- **Prevenção de Perda de Tarefa:** Ao despachar uma tarefa, ela é registrada em `running_tasks`. Se o socket de um worker cair inesperadamente, o master intercepta a falha e reinsere a tarefa na fila para reprocessamento.
+
+### Comunicação TLS e Thread de Envio
+
+Uma thread separada (`_supervisor_sender`) coleta os dados e envia-os a cada 10s. A conexão utiliza o módulo padrão `ssl` do Python para envelopar o socket TCP comum de forma segura (com suporte opcional a TLS e SNI). O envio é assíncrono para garantir que lentidão de rede externa ou instabilidade do supervisor não afetem a resposta a workers locais e negociações P2P.
+
+---
+
 ## Status da implementação
 
-O código atual implementa os principais elementos do SDD:
-- descoberta de master via UDP
-- heartbeat e registro de workers
-- fila FIFO de tarefas
-- apresentação de workers e resultado com ACK
-- eleição automática de novo master via broadcast
-- redirecionamento de workers entre masters
-- devolução de workers e notificação de retorno
+O código atual implementa todos os requisitos definidos nas Sprints 1 a 4:
+- Descoberta de master via UDP broadcast e heartbeat TCP
+- Distribuição confiável de tarefas e ciclo completo de processamento (QUERY -> STATUS -> ACK)
+- Tolerância a falhas com eleição automática de novo master via Bully Algorithm adaptado
+- Negociação P2P colaborativa (empréstimo de workers, redirecionamento e devolução controlada)
+- Telemetria de hardware e estado em tempo real integrada ao Supervisor Dashboard via conexões seguras TCP/TLS
 
-Essa documentação serve tanto como guia de implementação quanto como SDD para futuras evoluções.

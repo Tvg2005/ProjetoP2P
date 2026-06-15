@@ -1,4 +1,4 @@
-﻿# Planning da Implementação
+# Planning da Implementação
 
 ## Visão Geral do Projeto
 
@@ -41,6 +41,7 @@ O sistema foi projetado para:
 | RF-10 | Eleição via broadcast UDP puro (sem peers pré-configurados) | Sprint 2.1 |
 | RF-11 | Masters negociam recursos via protocolo P2P | Sprint 3 |
 | RF-12 | Masters redirecionam workers emprestados e permitem retorno | Sprint 3 |
+| RF-13 | Master envia relatórios periódicos de telemetria e desempenho para o supervisor via TCP/TLS | Sprint 4 |
 
 ---
 
@@ -130,6 +131,16 @@ O sistema foi projetado para:
 - `command_release` para devolução quando a carga normaliza
 - `notify_worker_returned` para atualizar o master original
 
+### Sprint 4 — Supervisor de Métricas e Apresentação Final
+
+**Objetivo:** Enviar telemetria detalhada de hardware, rede e estado do cluster P2P para o painel de visualização em tempo real.
+
+- Envio periódico (a cada 10s) de métricas de sistema (CPU, RAM, disco e load average)
+- Envio do estado da farm de workers (ativos, ociosos, emprestados, recebidos e falhos)
+- Envio do estado das tarefas (pendentes, executando, completadas, falhas e idade da mais antiga)
+- Monitoramento e anúncio da disponibilidade de masters vizinhos
+- Suporte a conexões seguras TCP com criptografia TLS/SNI
+
 ---
 
 ## Protocolo e Payloads
@@ -183,6 +194,9 @@ O sistema foi projetado para:
 - `command_release`
 - `notify_worker_returned`
 
+### Telemetria e Monitoramento (Sprint 4)
+- `performance_report` (Master → Supervisor via TCP/TLS)
+
 ---
 
 ## Critérios de Aceitação
@@ -194,6 +208,9 @@ O sistema foi projetado para:
 5. Worker recebe `ACK` após REPORT de status
 6. Worker emprestado é identificado por `SERVER_UUID`
 7. Eleição e descoberta funcionam sem IP fixo
+8. Master coleta métricas locais e de rede sem bloquear operações principais
+9. Master estabelece conexão TLS e envia JSON estruturado de telemetria periodicamente
+10. Painel do Supervisor atualiza com dados reais do nó master e workers associados
 
 ---
 

@@ -238,3 +238,84 @@ Se emprestado, inclui também:
   "RESPONSE":    "UNKNOWN_TASK"
 }
 ```
+
+---
+
+## Telemetria e Monitoramento — Supervisor (Sprint 4)
+
+### Relatório de Desempenho e Estado (`performance_report`)
+**Direção:** Master → Supervisor TCP/TLS  
+**Frequência:** `SUPERVISOR_INTERVAL` segundos (padrão: 10s)  
+
+```json
+{
+  "server_uuid": "SRV-MASTER",
+  "hostname": "master.farm.local",
+  "role": "master",
+  "task": "performance_report",
+  "timestamp": "2026-06-08T12:34:56Z",
+  "message_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "payload_version": "sprint4-monitor",
+  "performance": {
+    "system": {
+      "uptime_seconds": 12345,
+      "load_average_1m": 3.20,
+      "load_average_5m": 2.50,
+      "cpu": {
+        "usage_percent": 85.42,
+        "count_logical": 8,
+        "count_physical": 4
+      },
+      "memory": {
+        "total_mb": 16384,
+        "available_mb": 8192,
+        "percent_used": 62.18,
+        "memory_used": 8000
+      },
+      "disk": {
+        "total_gb": 512.0,
+        "free_gb": 250.0,
+        "percent_used": 45.0
+      }
+    },
+    "farm_state": {
+      "workers": {
+        "total_registered": 6,
+        "workers_utilization": 4,
+        "workers_alive": 6,
+        "workers_idle": 2,
+        "workers_borrowed": 1,
+        "workers_received": 1,
+        "workers_failed": 0,
+        "workers_home": 5,
+        "workers_available_capacity": 2,
+        "borrowed_workers": [
+          { "direction": "out", "peer_uuid": "michel_2" },
+          { "direction": "in", "peer_uuid": "michel_2" }
+        ]
+      },
+      "tasks": {
+        "tasks_pending": 42,
+        "tasks_running": 4,
+        "tasks_completed": 150,
+        "tasks_failed": 3,
+        "oldest_task_age_s": 312
+      }
+    },
+    "config_thresholds": {
+      "max_task": 100,
+      "warn_cpu_percent": 85,
+      "warn_memory_percent": 85,
+      "release_task": 60
+    },
+    "neighbors": [
+      {
+        "server_uuid": "michel_2",
+        "status": "available",
+        "last_heartbeat": "2026-06-08T12:34:56Z"
+      }
+    ]
+  }
+}
+```
+

@@ -565,10 +565,10 @@ def start_election_broadcast():
     else:
         with state_lock:
             election_in_progress = False
-        print(f"[ELECTION] Aguardando anúncio do vencedor ({NEW_MASTER_WAIT}s)…")
+        print(f"[ELECTION] Aguardando anúncio do vencedor ({NEW_MASTER_WAIT}s)...")
         received = new_master_event.wait(timeout=NEW_MASTER_WAIT)
         if not received:
-            print("[ELECTION] Vencedor não anunciou. Reiniciando eleição…")
+            print("[ELECTION] Vencedor não anunciou. Reiniciando eleição...")
             threading.Thread(target=start_election_broadcast, daemon=True).start()
 
 
@@ -586,7 +586,7 @@ def _become_master():
             "port": WORKER_PORT,
         })
 
-    print(f"[ELECTION] ★ {WORKER_UUID} é o novo MASTER ({WORKER_HOST}:{WORKER_PORT}) ★")
+    print(f"[ELECTION] * {WORKER_UUID} é o novo MASTER ({WORKER_HOST}:{WORKER_PORT}) *")
 
     env = os.environ.copy()
     env.update({
@@ -663,7 +663,7 @@ def _accept_new_master(host, port, uuid, free_space=0):
     if not (host and port and uuid):
         return
 
-    print(f"[ELECTION] ✓ Novo master aceito: {uuid} em {host}:{port}")
+    print(f"[ELECTION] [OK] Novo master aceito: {uuid} em {host}:{port}")
 
     with state_lock:
         if is_master and uuid != WORKER_UUID:
@@ -866,7 +866,7 @@ def _trigger_election_with_delay():
     Cancela se new_master_event for sinalizado durante a espera.
     """
     global election_in_progress
-    print(f"[HEARTBEAT] Aguardando {ELECTION_DELAY}s antes de iniciar eleição…")
+    print(f"[HEARTBEAT] Aguardando {ELECTION_DELAY}s antes de iniciar eleição...")
     cancelled = new_master_event.wait(timeout=ELECTION_DELAY)
     if cancelled:
         print("[HEARTBEAT] Novo master anunciado durante espera — eleição cancelada.")
@@ -931,7 +931,7 @@ def enviar_heartbeat():
                 #     _update_known_peers(peers_from_master)
 
             elif r == "NOT_MASTER":
-                print("[HEARTBEAT] Nó respondeu NOT_MASTER → iniciando eleição.")
+                print("[HEARTBEAT] Nó respondeu NOT_MASTER -> iniciando eleição.")
                 with state_lock:
                     already   = election_in_progress
                     failed_hb = HEARTBEAT_THRESHOLD
