@@ -310,6 +310,16 @@ As variáveis de ambiente novas ou ampliadas para Sprint 3 incluem:
 
 > Essa extensão permite que a rede de masters funcione de forma mais equilibrada, reduzindo sobrecarga e evitando que um único nó fique saturado.
 
+### Sprint 4 — Supervisor de Métricas e Telemetria
+
+A última sprint do projeto introduz suporte a monitoramento centralizado e observabilidade do cluster. O nó master coleta telemetria detalhada e envia para o Painel Supervisor via conexão TCP com criptografia TLS/SNI.
+
+- **Métricas do sistema:** Uptime do servidor, porcentagem de uso de CPU, load average (emulado no Windows), uso de memória (MB e %) e espaço livre em disco (GB e %).
+- **Estado da Farm:** Número total de workers registrados, ativos, ociosos, recebidos por empréstimo, emprestados para vizinhos e falhos (stale).
+- **Estado das Tarefas:** Quantidade de tarefas pendentes, em execução, concluídas com sucesso (OK), falhas (NOK) e a idade da tarefa mais antiga na fila.
+- **Status dos vizinhos:** Liveness de vizinhos de cluster cadastrados em `MASTER_NEIGHBORS`.
+- **Criptografia TLS e SNI:** Envio seguro para o dashboard online do professor.
+
 ---
 
 ## Configuração (`.env`)
@@ -339,6 +349,14 @@ MASTER_CAPACITY=100         # limite de tarefas antes de pedir ajuda
 MASTER_RELEASE_THRESHOLD=60 # carga mínima para liberar workers emprestados
 MASTER_HELP_TIMEOUT=5       # timeout para comunicação entre masters
 LOAD_MONITOR_INTERVAL=5     # intervalo em segundos para verificação de carga
+
+# Novas configurações de Sprint 4 (Supervisor de Métricas)
+SUPERVISOR_HOST=nuted-ia.dev
+SUPERVISOR_PORT=443
+SUPERVISOR_TLS=true
+SUPERVISOR_SNI=nuted-ia.dev
+SUPERVISOR_INTERVAL=10
+SUPERVISOR_PAYLOAD_VERSION=sprint4-monitor
 ```
 
 > `WORKER_PEERS` pode ficar **vazio** — os peers são descobertos automaticamente via master.
@@ -374,6 +392,11 @@ LOAD_MONITOR_INTERVAL=5     # intervalo em segundos para verificação de carga
 [SISTEMA RESTAURADO]
   1 novo master rodando (servidor.py no worker eleito)
   2 workers apontam para o novo master e continuam operando normalmente
+
+[TELEMETRIA E MONITORAMENTO — Sprint 4]
+  Master envia relatório de desempenho a cada 10s para o Supervisor
+  → Dados transmitidos via TCP seguro (TLS/SNI)
+  → Dashboard do cluster atualiza com dados do sistema, farm e tarefas em tempo real
 ```
 
 ---
@@ -384,4 +407,5 @@ LOAD_MONITOR_INTERVAL=5     # intervalo em segundos para verificação de carga
 - **Sockets TCP/UDP** — comunicação entre nós (biblioteca `socket` padrão)
 - **Threading** — múltiplas conexões simultâneas e eleição em paralelo
 - **python-dotenv** — leitura de configuração via `.env`
-- **schedule** — agendamento periódico do heartbeat
+- **schedule** — agendamento periódico do heartbeat e tarefas
+- **psutil** — coleta de métricas de hardware do sistema (CPU, RAM)
